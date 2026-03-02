@@ -1,0 +1,7 @@
+node_modules/
+logs/
+media/
+.env
+*.log
+.internal-token
+.DS_Store

@@ -1,0 +1,21 @@
+{
+  "name": "zylos-dingtalk",
+  "version": "0.1.0",
+  "description": "DingTalk (钉钉) communication component for Zylos",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "admin": "node src/admin.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dingtalk-stream": "^2.1.4",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
