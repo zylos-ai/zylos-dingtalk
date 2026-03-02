@@ -48,7 +48,7 @@ SDK level. No crypto.js needed.
 - client.js handles token lifecycle; send.js has its own standalone cache
 
 ### Internal API
-index.js exposes an HTTP server on 127.0.0.1:4459 for:
+index.js exposes an HTTP server on 127.0.0.1:4460 for:
 - `/internal/get-webhook` — send.js looks up sessionWebhook for an endpoint
 - `/internal/record-outgoing` — send.js records sent messages to chat history
 - Authenticated via random UUID token in `.internal-token` file

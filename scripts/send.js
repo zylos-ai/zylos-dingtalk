@@ -22,7 +22,7 @@ const HOME = process.env.HOME || '/home/owen';
 dotenv.config({ path: path.join(HOME, 'zylos/.env') });
 
 const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
-const INTERNAL_PORT = 4459;
+const INTERNAL_PORT = 4460;
 const MAX_TEXT_LENGTH = 2000;
 
 // --- Parse args ---

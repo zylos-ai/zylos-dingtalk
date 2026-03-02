@@ -418,7 +418,7 @@ async function main() {
   console.log(`[dingtalk] Starting... Data dir: ${DATA_DIR}`);
 
   // Start internal API (webhook port + 1000, following wecom pattern)
-  const internalPort = 4459; // fixed internal port
+  const internalPort = 4460; // fixed internal port (4459 used by wecom)
   internalServer = startInternalServer(internalPort);
 
   // Create stream client
