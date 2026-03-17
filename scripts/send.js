@@ -114,6 +114,53 @@ async function recordOutgoing(chatId, text) {
   await internalRequest('/internal/record-outgoing', { chatId, text });
 }
 
+// --- File lock (prevents concurrent queue read/write race) ---
+const LOCK_FILE = QUEUE_FILE + '.lock';
+const LOCK_STALE_MS = 30000; // consider lock stale after 30s
+
+function acquireLock() {
+  const deadline = Date.now() + 5000; // wait up to 5s
+  while (Date.now() < deadline) {
+    try {
+      // O_EXCL: atomic create, fails if file exists
+      const fd = fs.openSync(LOCK_FILE, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // Check if lock is stale
+      try {
+        const stat = fs.statSync(LOCK_FILE);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(LOCK_FILE);
+          continue; // retry immediately
+        }
+      } catch {
+        continue; // lock file disappeared, retry
+      }
+      // Wait 50ms and retry
+      const start = Date.now();
+      while (Date.now() - start < 50) { /* spin */ }
+    }
+  }
+  console.warn('[dingtalk] Queue lock timeout, proceeding without lock');
+  return false;
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE); } catch {}
+}
+
+function withLock(fn) {
+  acquireLock();
+  try {
+    return fn();
+  } finally {
+    releaseLock();
+  }
+}
+
 // --- Send queue (file-based, survives across invocations) ---
 function readQueue() {
   try {
@@ -128,13 +175,15 @@ function writeQueue(queue) {
 }
 
 function enqueue(item) {
-  const queue = readQueue();
-  queue.push(item);
-  while (queue.length > QUEUE_MAX) {
-    const dropped = queue.shift();
-    console.warn(`[dingtalk] Queue full, dropped oldest message to ${parseEndpoint(dropped.endpoint).id}`);
-  }
-  writeQueue(queue);
+  withLock(() => {
+    const queue = readQueue();
+    queue.push(item);
+    while (queue.length > QUEUE_MAX) {
+      const dropped = queue.shift();
+      console.warn(`[dingtalk] Queue full, dropped oldest message to ${parseEndpoint(dropped.endpoint).id}`);
+    }
+    writeQueue(queue);
+  });
 }
 
 // --- LLM merge for queued messages ---
@@ -169,7 +218,12 @@ ${messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join('\n')}`;
 }
 
 async function drainQueue() {
-  const queue = readQueue();
+  // Atomically read and clear queue (short lock window)
+  const queue = withLock(() => {
+    const q = readQueue();
+    if (q.length) writeQueue([]); // claim all items
+    return q;
+  });
   if (!queue.length) return;
 
   const now = Date.now();
@@ -188,10 +242,9 @@ async function drainQueue() {
     groups.get(key).items.push(item);
   }
 
-  let totalDelivered = 0;
   const deliveredGroups = []; // track for delay notice
 
-  for (const [key, group] of groups) {
+  for (const [, group] of groups) {
     const { items, endpoint } = group;
     const ep = parseEndpoint(endpoint);
 
@@ -206,7 +259,6 @@ async function drainQueue() {
 
     try {
       await sendMessage(endpoint, messageToSend);
-      totalDelivered += items.length;
       deliveredGroups.push({ endpoint, count: items.length, oldestCreatedAt: items[0].createdAt });
       console.log(`[dingtalk] Queue: delivered ${items.length} merged message(s) to ${ep.id}`);
     } catch (err) {
@@ -225,11 +277,18 @@ async function drainQueue() {
     }
   }
 
-  writeQueue(remaining);
+  // Write back failed items (merge with any new items added during drain)
+  if (remaining.length > 0) {
+    withLock(() => {
+      const current = readQueue(); // may have new items from concurrent enqueue
+      const merged = [...current, ...remaining];
+      while (merged.length > QUEUE_MAX) merged.shift();
+      writeQueue(merged);
+    });
+  }
 
   // Send delay notice for each recipient group
-  for (const { endpoint, count, oldestCreatedAt } of deliveredGroups) {
-    const ep = parseEndpoint(endpoint);
+  for (const { endpoint, oldestCreatedAt } of deliveredGroups) {
     const delaySec = Math.round((now - oldestCreatedAt) / 1000);
     const notice = `[提示] 以上消息因钉钉服务临时限流延迟了约 ${delaySec} 秒送达，已恢复正常。`;
     try {
