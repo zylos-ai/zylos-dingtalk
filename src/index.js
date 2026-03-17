@@ -413,6 +413,28 @@ watchConfig((newConfig) => {
   }
 });
 
+// --- Private IP detection ---
+function isPrivateIP(hostname) {
+  // Check for RFC 1918 private addresses and other non-routable ranges
+  const privatePatterns = [
+    /^10\./,                          // 10.0.0.0/8
+    /^172\.(1[6-9]|2\d|3[01])\./,    // 172.16.0.0/12
+    /^192\.168\./,                    // 192.168.0.0/16
+    /^127\./,                         // 127.0.0.0/8 (loopback)
+    /^169\.254\./,                    // 169.254.0.0/16 (link-local)
+  ];
+  return privatePatterns.some(p => p.test(hostname));
+}
+
+function extractHostFromURL(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname;
+  } catch {
+    return null;
+  }
+}
+
 // --- Main ---
 async function main() {
   console.log(`[dingtalk] Starting... Data dir: ${DATA_DIR}`);
@@ -445,10 +467,25 @@ async function main() {
     return { status: 'SUCCESS' };
   });
 
-  // Connect
+  // Connect with private IP detection — retry if gateway returns a private IP
+  const MAX_ENDPOINT_RETRIES = 3;
   try {
-    await streamClient.connect();
-    console.log('[dingtalk] Stream connected');
+    for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+      await streamClient.getEndpoint();
+      const host = extractHostFromURL(streamClient.dw_url);
+      if (host && isPrivateIP(host)) {
+        console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      await streamClient._connect();
+      console.log('[dingtalk] Stream connected');
+      return;
+    }
+    // All retries got private IPs, try connecting anyway as last resort
+    console.warn('[dingtalk] All endpoint retries returned private IPs, attempting connection anyway');
+    await streamClient._connect();
+    console.log('[dingtalk] Stream connected (private IP fallback)');
   } catch (err) {
     console.error('[dingtalk] Stream connection failed:', err.message);
     process.exit(1);
