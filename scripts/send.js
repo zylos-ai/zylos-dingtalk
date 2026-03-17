@@ -328,12 +328,12 @@ async function sendMedia(ep, type, filePath) {
   const token = await getAccessToken();
   const robotCode = process.env.DINGTALK_ROBOT_CODE;
 
-  // Upload media first
+  // Upload media first (recreate FormData on each retry — streams are single-use)
   const FormData = (await import('form-data')).default;
-  const form = new FormData();
-  form.append('media', fs.createReadStream(filePath));
 
   const uploadRes = await withRetry(async () => {
+    const form = new FormData();
+    form.append('media', fs.createReadStream(filePath));
     const res = await axios.post('https://oapi.dingtalk.com/media/upload', form, {
       params: { access_token: token, type: type === 'image' ? 'image' : 'file' },
       headers: form.getHeaders(),
@@ -352,33 +352,65 @@ async function sendMedia(ep, type, filePath) {
 
   if (type === 'image') {
     if (isGroup) {
-      return sendGroup(ep.id, 'sampleImageMsg', JSON.stringify({ photoURL: mediaId }));
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+          robotCode, openConversationId: ep.id,
+          msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `Group image to ${ep.id}`);
+        console.log(`[dingtalk] Group image sent to ${ep.id}`);
+        return res.data;
+      }, `group-image-${ep.id}`);
     } else {
-      const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-        robotCode, userIds: [ep.id],
-        msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
-      }, {
-        headers: { 'x-acs-dingtalk-access-token': token },
-        timeout: 15000,
-      });
-      validateResponse(res.data, `DM image to ${ep.id}`);
-      return res.data;
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+          robotCode, userIds: [ep.id],
+          msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `DM image to ${ep.id}`);
+        console.log(`[dingtalk] DM image sent to ${ep.id}`);
+        return res.data;
+      }, `dm-image-${ep.id}`);
     }
   } else {
     const fileName = path.basename(filePath);
     const fileType = path.extname(filePath).slice(1) || 'file';
     if (isGroup) {
-      return sendGroup(ep.id, 'sampleFile', JSON.stringify({ mediaId, fileName, fileType }));
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+          robotCode, openConversationId: ep.id,
+          msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `Group file to ${ep.id}`);
+        console.log(`[dingtalk] Group file sent to ${ep.id}`);
+        return res.data;
+      }, `group-file-${ep.id}`);
     } else {
-      const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-        robotCode, userIds: [ep.id],
-        msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
-      }, {
-        headers: { 'x-acs-dingtalk-access-token': token },
-        timeout: 15000,
-      });
-      validateResponse(res.data, `DM file to ${ep.id}`);
-      return res.data;
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+          robotCode, userIds: [ep.id],
+          msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `DM file to ${ep.id}`);
+        console.log(`[dingtalk] DM file sent to ${ep.id}`);
+        return res.data;
+      }, `dm-file-${ep.id}`);
     }
   }
 }

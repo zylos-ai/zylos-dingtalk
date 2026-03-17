@@ -59,11 +59,12 @@ export async function sendDM(userIds, msgKey, msgParam) {
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
-  if (res?.processQueryKey) {
-    console.log(`[dingtalk] DM sent to ${ids.join(',')} (msgKey=${msgKey})`);
-  } else if (res?.code) {
-    console.error(`[dingtalk] DM send failed: ${res.message || res.code} (users=${ids.join(',')})`);
+  if (res?.code && res.code !== 0) {
+    const msg = `DM send failed: ${res.message || res.code} (users=${ids.join(',')})`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
   }
+  console.log(`[dingtalk] DM sent to ${ids.join(',')} (msgKey=${msgKey})`);
   return res;
 }
 
@@ -78,11 +79,12 @@ export async function sendGroup(openConversationId, msgKey, msgParam) {
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
-  if (res?.processQueryKey) {
-    console.log(`[dingtalk] Group message sent to ${openConversationId} (msgKey=${msgKey})`);
-  } else if (res?.code) {
-    console.error(`[dingtalk] Group send failed: ${res.message || res.code} (group=${openConversationId})`);
+  if (res?.code && res.code !== 0) {
+    const msg = `Group send failed: ${res.message || res.code} (group=${openConversationId})`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
   }
+  console.log(`[dingtalk] Group message sent to ${openConversationId} (msgKey=${msgKey})`);
   return res;
 }
 
