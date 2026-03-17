@@ -93,5 +93,15 @@ export async function apiRequestV2(method, apiPath, data = null, options = {}) {
   }
 
   let res = await axios(axiosConfig);
+
+  // Retry once on invalid/expired token (align with V1 behavior)
+  if (res.data?.code === 'InvalidAuthentication' || res.data?.code === 'ForbiddenByDeniedPermission') {
+    console.warn(`[dingtalk] V2 token error (${res.data.code}), refreshing and retrying`);
+    resetToken();
+    const freshToken = await getAccessToken();
+    axiosConfig.headers['x-acs-dingtalk-access-token'] = freshToken;
+    res = await axios(axiosConfig);
+  }
+
   return res.data;
 }

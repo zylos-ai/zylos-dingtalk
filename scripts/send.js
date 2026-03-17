@@ -170,6 +170,19 @@ function hasMarkdown(text) {
 }
 
 // --- Send functions ---
+function validateResponse(res, context) {
+  if (res?.errcode && res.errcode !== 0) {
+    const msg = `${context}: ${res.errmsg || 'unknown error'} (errcode=${res.errcode})`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
+  }
+  if (res?.code && res.code !== 0) {
+    const msg = `${context}: ${res.message || res.code}`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
+  }
+}
+
 async function sendViaWebhook(webhookUrl, content) {
   const token = await getAccessToken();
   const body = { msgtype: 'text', text: { content } };
@@ -178,6 +191,7 @@ async function sendViaWebhook(webhookUrl, content) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, 'Webhook text send');
   return res.data;
 }
 
@@ -189,6 +203,7 @@ async function sendMarkdownViaWebhook(webhookUrl, title, text) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, 'Webhook markdown send');
   return res.data;
 }
 
@@ -206,6 +221,8 @@ async function sendTextDM(userId, content) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, `DM text to ${userId}`);
+  console.log(`[dingtalk] DM text sent to ${userId}`);
   return res.data;
 }
 
@@ -223,6 +240,8 @@ async function sendMarkdownDM(userId, title, text) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, `DM markdown to ${userId}`);
+  console.log(`[dingtalk] DM markdown sent to ${userId}`);
   return res.data;
 }
 
@@ -240,6 +259,8 @@ async function sendTextGroup(conversationId, content) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, `Group text to ${conversationId}`);
+  console.log(`[dingtalk] Group text sent to ${conversationId}`);
   return res.data;
 }
 
@@ -257,6 +278,8 @@ async function sendMarkdownGroup(conversationId, title, text) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  validateResponse(res.data, `Group markdown to ${conversationId}`);
+  console.log(`[dingtalk] Group markdown sent to ${conversationId}`);
   return res.data;
 }
 
@@ -277,8 +300,9 @@ async function sendMedia(ep, type, filePath) {
   });
 
   if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-    throw new Error(`Upload failed: ${uploadRes.data.errmsg}`);
+    throw new Error(`Upload failed: ${uploadRes.data.errmsg} (errcode=${uploadRes.data.errcode})`);
   }
+  console.log(`[dingtalk] Media uploaded: ${type}, mediaId=${uploadRes.data.media_id}`);
 
   const mediaId = uploadRes.data.media_id;
   const isGroup = ep.type === 'group';
@@ -294,6 +318,7 @@ async function sendMedia(ep, type, filePath) {
         headers: { 'x-acs-dingtalk-access-token': token },
         timeout: 15000,
       });
+      validateResponse(res.data, `DM image to ${ep.id}`);
       return res.data;
     }
   } else {
@@ -309,6 +334,7 @@ async function sendMedia(ep, type, filePath) {
         headers: { 'x-acs-dingtalk-access-token': token },
         timeout: 15000,
       });
+      validateResponse(res.data, `DM file to ${ep.id}`);
       return res.data;
     }
   }
@@ -324,7 +350,7 @@ async function run() {
   if (mediaMatch) {
     const [, mediaType, mediaPath] = mediaMatch;
     await sendMedia(ep, mediaType, mediaPath.trim());
-    console.log(`[dingtalk] Media sent: ${mediaType}`);
+    console.log(`[dingtalk] Media ${mediaType} sent to ${ep.id} (${ep.type || 'DM'})`);
     return;
   }
 
@@ -334,8 +360,14 @@ async function run() {
   // Try sessionWebhook first (fastest, works for replies)
   const webhookUrl = await getSessionWebhook(endpoint);
 
-  for (let i = 0; i < chunks.length; i++) {
+  const totalChunks = chunks.length;
+  if (totalChunks > 1) {
+    console.log(`[dingtalk] Sending ${totalChunks} chunks to ${ep.id} (${isGroup ? 'group' : 'DM'})`);
+  }
+
+  for (let i = 0; i < totalChunks; i++) {
     const chunk = chunks[i];
+    const chunkLabel = totalChunks > 1 ? ` [${i + 1}/${totalChunks}]` : '';
     let sent = false;
 
     // Try webhook reply first
@@ -347,8 +379,9 @@ async function run() {
           await sendViaWebhook(webhookUrl, chunk);
         }
         sent = true;
+        if (totalChunks > 1) console.log(`[dingtalk] Chunk${chunkLabel} sent via webhook`);
       } catch (err) {
-        console.error(`[dingtalk] Webhook reply failed, falling back to API: ${err.message}`);
+        console.error(`[dingtalk] Webhook reply failed${chunkLabel}, falling back to API: ${err.message}`);
       }
     }
 
@@ -367,10 +400,11 @@ async function run() {
           await sendTextDM(ep.id, chunk);
         }
       }
+      if (totalChunks > 1) console.log(`[dingtalk] Chunk${chunkLabel} sent via API`);
     }
 
     // Delay between chunks
-    if (i < chunks.length - 1) {
+    if (i < totalChunks - 1) {
       await new Promise(r => setTimeout(r, 500));
     }
   }
@@ -379,7 +413,7 @@ async function run() {
   const chatId = isGroup ? ep.id : ep.id;
   await recordOutgoing(chatId, message.slice(0, 4000));
 
-  console.log(`[dingtalk] Sent ${chunks.length} chunk(s) to ${ep.id}`);
+  console.log(`[dingtalk] Sent ${totalChunks} chunk(s) to ${ep.id} (${isGroup ? 'group' : 'DM'})`);
 }
 
 run().catch(err => {

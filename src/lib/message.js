@@ -19,6 +19,10 @@ export async function replyViaWebhook(sessionWebhook, msgtype, body) {
     headers: { 'x-acs-dingtalk-access-token': token },
     timeout: 15000,
   });
+  if (res.data?.errcode && res.data.errcode !== 0) {
+    console.error(`[dingtalk] Webhook reply failed: ${res.data.errmsg} (errcode=${res.data.errcode})`);
+    throw new Error(`Webhook reply failed: ${res.data.errmsg}`);
+  }
   return res.data;
 }
 
@@ -48,12 +52,19 @@ export async function replyMarkdown(sessionWebhook, title, text, atUserIds = [])
  */
 export async function sendDM(userIds, msgKey, msgParam) {
   const creds = getCredentials();
-  return apiRequestV2('POST', '/v1.0/robot/oToMessages/batchSend', {
+  const ids = Array.isArray(userIds) ? userIds : [userIds];
+  const res = await apiRequestV2('POST', '/v1.0/robot/oToMessages/batchSend', {
     robotCode: creds.robot_code,
-    userIds: Array.isArray(userIds) ? userIds : [userIds],
+    userIds: ids,
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
+  if (res?.processQueryKey) {
+    console.log(`[dingtalk] DM sent to ${ids.join(',')} (msgKey=${msgKey})`);
+  } else if (res?.code) {
+    console.error(`[dingtalk] DM send failed: ${res.message || res.code} (users=${ids.join(',')})`);
+  }
+  return res;
 }
 
 /**
@@ -61,12 +72,18 @@ export async function sendDM(userIds, msgKey, msgParam) {
  */
 export async function sendGroup(openConversationId, msgKey, msgParam) {
   const creds = getCredentials();
-  return apiRequestV2('POST', '/v1.0/robot/groupMessages/send', {
+  const res = await apiRequestV2('POST', '/v1.0/robot/groupMessages/send', {
     robotCode: creds.robot_code,
     openConversationId,
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
+  if (res?.processQueryKey) {
+    console.log(`[dingtalk] Group message sent to ${openConversationId} (msgKey=${msgKey})`);
+  } else if (res?.code) {
+    console.error(`[dingtalk] Group send failed: ${res.message || res.code} (group=${openConversationId})`);
+  }
+  return res;
 }
 
 /**
