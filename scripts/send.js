@@ -15,8 +15,12 @@
 
 import path from 'path';
 import fs from 'fs';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import axios from 'axios';
 import dotenv from 'dotenv';
+
+const execFileAsync = promisify(execFile);
 
 const HOME = process.env.HOME || '/home/owen';
 dotenv.config({ path: path.join(HOME, 'zylos/.env') });
@@ -28,7 +32,7 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY = 1000;
 const QUEUE_FILE = path.join(DATA_DIR, '.send-queue.json');
 const QUEUE_MAX = 10;
-const QUEUE_MAX_AGE_MS = 5 * 60 * 1000; // drop items older than 5 minutes
+const QUEUE_MAX_AGE_MS = 30 * 60 * 1000; // drop items older than 30 minutes
 
 function isRetryable(err) {
   if (err.response?.status === 429) return true;
@@ -133,54 +137,105 @@ function enqueue(item) {
   writeQueue(queue);
 }
 
+// --- LLM merge for queued messages ---
+async function mergeMessages(messages) {
+  if (messages.length <= 1) return messages[0] || '';
+
+  const prompt = `You are a message merge assistant. Below are ${messages.length} messages that were delayed due to DingTalk service throttling. They were meant to be sent to the same recipient in order. Merge them into a single coherent message:
+- Remove duplicate or near-duplicate content
+- Preserve all unique information
+- Keep the original tone and language
+- If all messages are truly different, just join them with line breaks
+- Output ONLY the merged message, no explanation
+
+Messages:
+${messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join('\n')}`;
+
+  try {
+    const { stdout } = await execFileAsync('claude', ['-p', '--model', 'haiku'], {
+      input: prompt,
+      timeout: 30000,
+      env: { ...process.env, CLAUDE_BYPASS_PERMISSIONS: 'true' },
+    });
+    const merged = stdout.trim();
+    if (merged) return merged;
+  } catch (err) {
+    console.warn(`[dingtalk] LLM merge failed, sending separately: ${err.message}`);
+  }
+
+  // Fallback: simple dedup by joining unique messages
+  const unique = [...new Set(messages)];
+  return unique.join('\n\n');
+}
+
 async function drainQueue() {
   const queue = readQueue();
   if (!queue.length) return;
 
   const now = Date.now();
   const remaining = [];
-  const delivered = []; // track delivered items for delay notice
 
+  // Separate valid items from expired, group by recipient
+  const groups = new Map(); // key -> { items, endpoint }
   for (const item of queue) {
-    // Drop items older than max age
     if (now - item.createdAt > QUEUE_MAX_AGE_MS) {
       console.warn(`[dingtalk] Queue: expired message to ${parseEndpoint(item.endpoint).id} (age ${Math.round((now - item.createdAt) / 1000)}s)`);
       continue;
     }
+    const ep = parseEndpoint(item.endpoint);
+    const key = `${ep.id}|${ep.type || 'p2p'}`;
+    if (!groups.has(key)) groups.set(key, { items: [], endpoint: item.endpoint });
+    groups.get(key).items.push(item);
+  }
+
+  let totalDelivered = 0;
+  const deliveredGroups = []; // track for delay notice
+
+  for (const [key, group] of groups) {
+    const { items, endpoint } = group;
+    const ep = parseEndpoint(endpoint);
+
+    // Merge messages if multiple for same recipient
+    let messageToSend;
+    if (items.length > 1) {
+      console.log(`[dingtalk] Queue: merging ${items.length} messages for ${ep.id}`);
+      messageToSend = await mergeMessages(items.map(i => i.message));
+    } else {
+      messageToSend = items[0].message;
+    }
 
     try {
-      await sendMessage(item.endpoint, item.message);
-      delivered.push(item);
-      console.log(`[dingtalk] Queue: delivered delayed message to ${parseEndpoint(item.endpoint).id}`);
+      await sendMessage(endpoint, messageToSend);
+      totalDelivered += items.length;
+      deliveredGroups.push({ endpoint, count: items.length, oldestCreatedAt: items[0].createdAt });
+      console.log(`[dingtalk] Queue: delivered ${items.length} merged message(s) to ${ep.id}`);
     } catch (err) {
-      item.attempts = (item.attempts || 0) + 1;
-      if (isRetryable(err) && item.attempts < MAX_RETRIES) {
-        remaining.push(item);
-        console.warn(`[dingtalk] Queue: still failing for ${parseEndpoint(item.endpoint).id} (attempt ${item.attempts}/${MAX_RETRIES}), keeping in queue`);
-      } else {
-        console.error(`[dingtalk] Queue: dropped message to ${parseEndpoint(item.endpoint).id} after ${item.attempts} drain attempts: ${err.message}`);
+      // On failure, put all items back with incremented attempts
+      for (const item of items) {
+        item.attempts = (item.attempts || 0) + 1;
+        if (isRetryable(err) && item.attempts < MAX_RETRIES) {
+          remaining.push(item);
+        } else {
+          console.error(`[dingtalk] Queue: dropped message to ${ep.id} after ${item.attempts} drain attempts: ${err.message}`);
+        }
+      }
+      if (remaining.length > 0) {
+        console.warn(`[dingtalk] Queue: still failing for ${ep.id}, keeping ${items.length} item(s) in queue`);
       }
     }
   }
 
   writeQueue(remaining);
 
-  // Send delay notice to each unique recipient that received queued messages
-  if (delivered.length > 0) {
-    const notified = new Set();
-    for (const item of delivered) {
-      const ep = parseEndpoint(item.endpoint);
-      const key = `${ep.id}|${ep.type || 'p2p'}`;
-      if (notified.has(key)) continue;
-      notified.add(key);
-
-      const delaySec = Math.round((now - item.createdAt) / 1000);
-      const notice = `[提示] 以上 ${delivered.filter(d => parseEndpoint(d.endpoint).id === ep.id).length} 条消息因钉钉服务临时限流延迟了约 ${delaySec} 秒送达，已恢复正常。`;
-      try {
-        await sendMessage(item.endpoint, notice);
-      } catch {
-        // best-effort notice, don't fail if it can't be sent
-      }
+  // Send delay notice for each recipient group
+  for (const { endpoint, count, oldestCreatedAt } of deliveredGroups) {
+    const ep = parseEndpoint(endpoint);
+    const delaySec = Math.round((now - oldestCreatedAt) / 1000);
+    const notice = `[提示] 以上消息因钉钉服务临时限流延迟了约 ${delaySec} 秒送达，已恢复正常。`;
+    try {
+      await sendMessage(endpoint, notice);
+    } catch {
+      // best-effort notice
     }
   }
 }
