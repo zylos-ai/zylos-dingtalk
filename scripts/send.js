@@ -24,6 +24,34 @@ dotenv.config({ path: path.join(HOME, 'zylos/.env') });
 const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
 const INTERNAL_PORT = 4460;
 const MAX_TEXT_LENGTH = 2000;
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY = 1000;
+
+function isRetryable(err) {
+  if (err.response?.status === 429) return true;
+  if (err.response?.data?.code === 'Throttling') return true;
+  const code = err.code;
+  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
+}
+
+async function withRetry(fn, context = '') {
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_RETRIES && isRetryable(err)) {
+        const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
+        console.warn(`[dingtalk] ${context} retryable error (attempt ${attempt + 1}/${MAX_RETRIES}): ${err.message}. Retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
 
 // --- Parse args ---
 const [endpoint, ...msgParts] = process.argv.slice(2);
@@ -184,103 +212,115 @@ function validateResponse(res, context) {
 }
 
 async function sendViaWebhook(webhookUrl, content) {
-  const token = await getAccessToken();
-  const body = { msgtype: 'text', text: { content } };
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const body = { msgtype: 'text', text: { content } };
 
-  const res = await axios.post(webhookUrl, body, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, 'Webhook text send');
-  return res.data;
+    const res = await axios.post(webhookUrl, body, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, 'Webhook text send');
+    return res.data;
+  }, 'webhook-text');
 }
 
 async function sendMarkdownViaWebhook(webhookUrl, title, text) {
-  const token = await getAccessToken();
-  const body = { msgtype: 'markdown', markdown: { title, text } };
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const body = { msgtype: 'markdown', markdown: { title, text } };
 
-  const res = await axios.post(webhookUrl, body, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, 'Webhook markdown send');
-  return res.data;
+    const res = await axios.post(webhookUrl, body, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, 'Webhook markdown send');
+    return res.data;
+  }, 'webhook-markdown');
 }
 
 async function sendTextDM(userId, content) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-    robotCode,
-    userIds: [userId],
-    msgKey: 'sampleText',
-    msgParam: JSON.stringify({ content }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, `DM text to ${userId}`);
-  console.log(`[dingtalk] DM text sent to ${userId}`);
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+      robotCode,
+      userIds: [userId],
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `DM text to ${userId}`);
+    console.log(`[dingtalk] DM text sent to ${userId}`);
+    return res.data;
+  }, `dm-text-${userId}`);
 }
 
 async function sendMarkdownDM(userId, title, text) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-    robotCode,
-    userIds: [userId],
-    msgKey: 'sampleMarkdown',
-    msgParam: JSON.stringify({ title, text }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, `DM markdown to ${userId}`);
-  console.log(`[dingtalk] DM markdown sent to ${userId}`);
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+      robotCode,
+      userIds: [userId],
+      msgKey: 'sampleMarkdown',
+      msgParam: JSON.stringify({ title, text }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `DM markdown to ${userId}`);
+    console.log(`[dingtalk] DM markdown sent to ${userId}`);
+    return res.data;
+  }, `dm-markdown-${userId}`);
 }
 
 async function sendTextGroup(conversationId, content) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
-    robotCode,
-    openConversationId: conversationId,
-    msgKey: 'sampleText',
-    msgParam: JSON.stringify({ content }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, `Group text to ${conversationId}`);
-  console.log(`[dingtalk] Group text sent to ${conversationId}`);
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+      robotCode,
+      openConversationId: conversationId,
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `Group text to ${conversationId}`);
+    console.log(`[dingtalk] Group text sent to ${conversationId}`);
+    return res.data;
+  }, `group-text-${conversationId}`);
 }
 
 async function sendMarkdownGroup(conversationId, title, text) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
-    robotCode,
-    openConversationId: conversationId,
-    msgKey: 'sampleMarkdown',
-    msgParam: JSON.stringify({ title, text }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  validateResponse(res.data, `Group markdown to ${conversationId}`);
-  console.log(`[dingtalk] Group markdown sent to ${conversationId}`);
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+      robotCode,
+      openConversationId: conversationId,
+      msgKey: 'sampleMarkdown',
+      msgParam: JSON.stringify({ title, text }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `Group markdown to ${conversationId}`);
+    console.log(`[dingtalk] Group markdown sent to ${conversationId}`);
+    return res.data;
+  }, `group-markdown-${conversationId}`);
 }
 
 // --- Media sending ---
@@ -293,15 +333,18 @@ async function sendMedia(ep, type, filePath) {
   const form = new FormData();
   form.append('media', fs.createReadStream(filePath));
 
-  const uploadRes = await axios.post('https://oapi.dingtalk.com/media/upload', form, {
-    params: { access_token: token, type: type === 'image' ? 'image' : 'file' },
-    headers: form.getHeaders(),
-    timeout: 60000,
-  });
+  const uploadRes = await withRetry(async () => {
+    const res = await axios.post('https://oapi.dingtalk.com/media/upload', form, {
+      params: { access_token: token, type: type === 'image' ? 'image' : 'file' },
+      headers: form.getHeaders(),
+      timeout: 60000,
+    });
+    if (res.data.errcode && res.data.errcode !== 0) {
+      throw new Error(`Upload failed: ${res.data.errmsg} (errcode=${res.data.errcode})`);
+    }
+    return res;
+  }, 'media-upload');
 
-  if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-    throw new Error(`Upload failed: ${uploadRes.data.errmsg} (errcode=${uploadRes.data.errcode})`);
-  }
   console.log(`[dingtalk] Media uploaded: ${type}, mediaId=${uploadRes.data.media_id}`);
 
   const mediaId = uploadRes.data.media_id;
