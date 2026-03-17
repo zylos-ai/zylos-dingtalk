@@ -26,6 +26,9 @@ const INTERNAL_PORT = 4460;
 const MAX_TEXT_LENGTH = 2000;
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY = 1000;
+const QUEUE_FILE = path.join(DATA_DIR, '.send-queue.json');
+const QUEUE_MAX = 10;
+const QUEUE_MAX_AGE_MS = 5 * 60 * 1000; // drop items older than 5 minutes
 
 function isRetryable(err) {
   if (err.response?.status === 429) return true;
@@ -105,6 +108,81 @@ async function getSessionWebhook(ep) {
 
 async function recordOutgoing(chatId, text) {
   await internalRequest('/internal/record-outgoing', { chatId, text });
+}
+
+// --- Send queue (file-based, survives across invocations) ---
+function readQueue() {
+  try {
+    return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function writeQueue(queue) {
+  fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue), 'utf8');
+}
+
+function enqueue(item) {
+  const queue = readQueue();
+  queue.push(item);
+  while (queue.length > QUEUE_MAX) {
+    const dropped = queue.shift();
+    console.warn(`[dingtalk] Queue full, dropped oldest message to ${parseEndpoint(dropped.endpoint).id}`);
+  }
+  writeQueue(queue);
+}
+
+async function drainQueue() {
+  const queue = readQueue();
+  if (!queue.length) return;
+
+  const now = Date.now();
+  const remaining = [];
+  const delivered = []; // track delivered items for delay notice
+
+  for (const item of queue) {
+    // Drop items older than max age
+    if (now - item.createdAt > QUEUE_MAX_AGE_MS) {
+      console.warn(`[dingtalk] Queue: expired message to ${parseEndpoint(item.endpoint).id} (age ${Math.round((now - item.createdAt) / 1000)}s)`);
+      continue;
+    }
+
+    try {
+      await sendMessage(item.endpoint, item.message);
+      delivered.push(item);
+      console.log(`[dingtalk] Queue: delivered delayed message to ${parseEndpoint(item.endpoint).id}`);
+    } catch (err) {
+      item.attempts = (item.attempts || 0) + 1;
+      if (isRetryable(err) && item.attempts < MAX_RETRIES) {
+        remaining.push(item);
+        console.warn(`[dingtalk] Queue: still failing for ${parseEndpoint(item.endpoint).id} (attempt ${item.attempts}/${MAX_RETRIES}), keeping in queue`);
+      } else {
+        console.error(`[dingtalk] Queue: dropped message to ${parseEndpoint(item.endpoint).id} after ${item.attempts} drain attempts: ${err.message}`);
+      }
+    }
+  }
+
+  writeQueue(remaining);
+
+  // Send delay notice to each unique recipient that received queued messages
+  if (delivered.length > 0) {
+    const notified = new Set();
+    for (const item of delivered) {
+      const ep = parseEndpoint(item.endpoint);
+      const key = `${ep.id}|${ep.type || 'p2p'}`;
+      if (notified.has(key)) continue;
+      notified.add(key);
+
+      const delaySec = Math.round((now - item.createdAt) / 1000);
+      const notice = `[提示] 以上 ${delivered.filter(d => parseEndpoint(d.endpoint).id === ep.id).length} 条消息因钉钉服务临时限流延迟了约 ${delaySec} 秒送达，已恢复正常。`;
+      try {
+        await sendMessage(item.endpoint, notice);
+      } catch {
+        // best-effort notice, don't fail if it can't be sent
+      }
+    }
+  }
 }
 
 // --- Token management (standalone, for when index.js is not running) ---
@@ -415,13 +493,13 @@ async function sendMedia(ep, type, filePath) {
   }
 }
 
-// --- Main send logic ---
-async function run() {
-  const ep = parseEndpoint(endpoint);
+// --- Core send logic (used by both direct sends and queue drain) ---
+async function sendMessage(endpointStr, msg) {
+  const ep = parseEndpoint(endpointStr);
   const isGroup = ep.type === 'group';
 
   // Check for media
-  const mediaMatch = message.match(/^\[MEDIA:(\w+)\](.+)$/);
+  const mediaMatch = msg.match(/^\[MEDIA:(\w+)\](.+)$/);
   if (mediaMatch) {
     const [, mediaType, mediaPath] = mediaMatch;
     await sendMedia(ep, mediaType, mediaPath.trim());
@@ -430,10 +508,10 @@ async function run() {
   }
 
   // Text message — chunk and send
-  const chunks = chunkMessage(message);
+  const chunks = chunkMessage(msg);
 
   // Try sessionWebhook first (fastest, works for replies)
-  const webhookUrl = await getSessionWebhook(endpoint);
+  const webhookUrl = await getSessionWebhook(endpointStr);
 
   const totalChunks = chunks.length;
   if (totalChunks > 1) {
@@ -485,13 +563,30 @@ async function run() {
   }
 
   // Record outgoing to history
-  const chatId = isGroup ? ep.id : ep.id;
-  await recordOutgoing(chatId, message.slice(0, 4000));
+  await recordOutgoing(ep.id, msg.slice(0, 4000));
 
   console.log(`[dingtalk] Sent ${totalChunks} chunk(s) to ${ep.id} (${isGroup ? 'group' : 'DM'})`);
 }
 
-run().catch(err => {
+// --- Main entry point ---
+async function main() {
+  // Drain queued messages first
+  await drainQueue();
+
+  // Send current message
+  try {
+    await sendMessage(endpoint, message);
+  } catch (err) {
+    if (isRetryable(err)) {
+      enqueue({ endpoint, message, attempts: 0, createdAt: Date.now() });
+      console.warn(`[dingtalk] Send failed (retryable), queued for later delivery: ${err.message}`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+main().catch(err => {
   console.error(`[dingtalk] Send failed: ${err.message}`);
   process.exit(1);
 });
