@@ -15,12 +15,9 @@
 
 import path from 'path';
 import fs from 'fs';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
-
-const execFileAsync = promisify(execFile);
 
 const HOME = process.env.HOME || '/home/owen';
 dotenv.config({ path: path.join(HOME, 'zylos/.env') });
@@ -187,6 +184,28 @@ function enqueue(item) {
 }
 
 // --- LLM merge for queued messages ---
+function runClaude(input) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('claude', ['-p', '--model', 'haiku'], {
+      env: { ...process.env, CLAUDE_BYPASS_PERMISSIONS: 'true' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => stdout += d);
+    proc.stderr.on('data', d => stderr += d);
+    proc.on('close', code => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(stderr || `claude exited with code ${code}`));
+    });
+    proc.on('error', reject);
+    const timer = setTimeout(() => { proc.kill(); reject(new Error('claude timeout')); }, 60000);
+    proc.on('close', () => clearTimeout(timer));
+    proc.stdin.write(input);
+    proc.stdin.end();
+  });
+}
+
 async function mergeMessages(messages) {
   if (messages.length <= 1) return messages[0] || '';
 
@@ -201,15 +220,11 @@ Messages:
 ${messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join('\n')}`;
 
   try {
-    const { stdout } = await execFileAsync('claude', ['-p', '--model', 'haiku'], {
-      input: prompt,
-      timeout: 30000,
-      env: { ...process.env, CLAUDE_BYPASS_PERMISSIONS: 'true' },
-    });
-    const merged = stdout.trim();
+    const result = await runClaude(prompt);
+    const merged = result.trim();
     if (merged) return merged;
   } catch (err) {
-    console.warn(`[dingtalk] LLM merge failed, sending separately: ${err.message}`);
+    console.warn(`[dingtalk] LLM merge failed, using fallback: ${err.message}`);
   }
 
   // Fallback: simple dedup by joining unique messages
