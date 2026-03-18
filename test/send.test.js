@@ -1,9 +1,9 @@
 /**
  * Tests for scripts/send.js helper functions.
  *
- * send.js is a CLI script — we test the extracted logic (validateResponse,
- * withRetry, isRetryable, chunkMessage, queue management) and verify media
- * upload creates fresh streams on retry.
+ * Tests import shared modules (retry.js) directly — the same code
+ * used by production. Pure helper logic (chunkMessage, validateResponse,
+ * queue management) is replicated here since send.js is a CLI entry point.
  */
 
 import { jest } from '@jest/globals';
@@ -11,17 +11,18 @@ import { Readable } from 'stream';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { isRetryable, withRetry } from '../src/lib/retry.js';
 
-// ─── validateResponse (inline re-implementation for testing) ──────────────────
-// send.js defines this function internally. We replicate the logic here
-// to verify the contract, since send.js is a CLI entry point.
+// ─── validateResponse (matches send.js implementation) ──────────────────────
+// DingTalk V1 responses use numeric errcode (0 = success).
+// V2 responses use string code (absent or "0" = success, non-zero string = error).
 
 function validateResponse(res, context) {
   if (res?.errcode && res.errcode !== 0) {
     const msg = `${context}: ${res.errmsg || 'unknown error'} (errcode=${res.errcode})`;
     throw new Error(msg);
   }
-  if (res?.code && res.code !== 0) {
+  if (res?.code && String(res.code) !== '0') {
     const msg = `${context}: ${res.message || res.code}`;
     throw new Error(msg);
   }
@@ -58,37 +59,15 @@ describe('validateResponse', () => {
       validateResponse({ errcode: 500, errmsg: 'server error' }, 'DM text to user-1'),
     ).toThrow('DM text to user-1: server error');
   });
+
+  test('passes on string "0" code (V2 success variant)', () => {
+    expect(() => validateResponse({ code: '0' }, 'test')).not.toThrow();
+  });
+
+  test('passes on numeric 0 code', () => {
+    expect(() => validateResponse({ code: 0 }, 'test')).not.toThrow();
+  });
 });
-
-// ─── withRetry (inline re-implementation for testing) ─────────────────────────
-
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY = 1; // 1ms for fast tests
-
-function isRetryable(err) {
-  if (err.response?.status === 429) return true;
-  if (err.response?.data?.code === 'Throttling') return true;
-  const code = err.code;
-  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
-}
-
-async function withRetry(fn, context = '') {
-  let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < MAX_RETRIES && isRetryable(err)) {
-        const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
-        await new Promise(r => setTimeout(r, delay));
-      } else {
-        throw err;
-      }
-    }
-  }
-  throw lastErr;
-}
 
 // ─── Media upload stream recreation on retry ──────────────────────────────────
 
@@ -104,13 +83,14 @@ describe('media upload retry creates fresh stream', () => {
     err429.response = { status: 429 };
 
     let callCount = 0;
+    // Use fast baseDelay for tests
     const upload = () => withRetry(async () => {
       // This simulates the fixed code: FormData + stream created inside retry
       const stream = createStream();
       callCount++;
       if (callCount <= 2) throw err429;
       return { data: { errcode: 0, media_id: 'mid-123' } };
-    }, 'media-upload');
+    }, 'media-upload', { baseDelay: 1 });
 
     const result = await upload();
     expect(result.data.media_id).toBe('mid-123');
@@ -119,7 +99,7 @@ describe('media upload retry creates fresh stream', () => {
   });
 });
 
-// ─── chunkMessage (inline re-implementation) ──────────────────────────────────
+// ─── chunkMessage (matches send.js implementation) ──────────────────────────
 
 function chunkMessage(text, maxLen = 2000) {
   if (text.length <= maxLen) return [text];
@@ -280,7 +260,7 @@ describe('queue management', () => {
   });
 });
 
-// ─── isRetryable ────────────────────────────────────────────────────────────────
+// ─── isRetryable (imported from shared module) ──────────────────────────────
 
 describe('isRetryable', () => {
   test('returns true for HTTP 429', () => {
@@ -327,5 +307,36 @@ describe('isRetryable', () => {
 
   test('returns false for generic errors', () => {
     expect(isRetryable(new Error('missing config'))).toBe(false);
+  });
+});
+
+// ─── withRetry (imported from shared module) ────────────────────────────────
+
+describe('withRetry', () => {
+  test('returns result on success', async () => {
+    const result = await withRetry(() => Promise.resolve('ok'), 'test', { baseDelay: 1 });
+    expect(result).toBe('ok');
+  });
+
+  test('retries on retryable error and succeeds', async () => {
+    let calls = 0;
+    const err = new Error('timeout');
+    err.code = 'ETIMEDOUT';
+    const result = await withRetry(async () => {
+      calls++;
+      if (calls < 3) throw err;
+      return 'recovered';
+    }, 'test', { baseDelay: 1 });
+    expect(result).toBe('recovered');
+    expect(calls).toBe(3);
+  });
+
+  test('throws immediately on non-retryable error', async () => {
+    let calls = 0;
+    await expect(withRetry(async () => {
+      calls++;
+      throw new Error('auth failure');
+    }, 'test', { baseDelay: 1 })).rejects.toThrow('auth failure');
+    expect(calls).toBe(1);
   });
 });

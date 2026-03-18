@@ -1,3 +1,4 @@
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -8,10 +9,9 @@ import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { getUserInfo } from './lib/contact.js';
 
-const HOME = process.env.HOME || '/home/owen';
-dotenv.config({ path: path.join(HOME, 'zylos/.env') });
+dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const C4_RECEIVE = path.join(os.homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 
@@ -478,12 +478,15 @@ async function main() {
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
         continue;
       }
+      // _connect() is a private method of dingtalk-stream DWClient.
+      // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
       await streamClient._connect();
       console.log('[dingtalk] Stream connected');
       return;
     }
     // All retries got private IPs, try connecting anyway as last resort
     console.warn('[dingtalk] All endpoint retries returned private IPs, attempting connection anyway');
+    // See version note above re: _connect()
     await streamClient._connect();
     console.log('[dingtalk] Stream connected (private IP fallback)');
   } catch (err) {

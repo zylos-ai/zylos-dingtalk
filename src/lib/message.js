@@ -59,7 +59,7 @@ export async function sendDM(userIds, msgKey, msgParam) {
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
-  if (res?.code && res.code !== 0) {
+  if (res?.code && String(res.code) !== '0') {
     const msg = `DM send failed: ${res.message || res.code} (users=${ids.join(',')})`;
     console.error(`[dingtalk] ${msg}`);
     throw new Error(msg);
@@ -79,7 +79,7 @@ export async function sendGroup(openConversationId, msgKey, msgParam) {
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),
   });
-  if (res?.code && res.code !== 0) {
+  if (res?.code && String(res.code) !== '0') {
     const msg = `Group send failed: ${res.message || res.code} (group=${openConversationId})`;
     console.error(`[dingtalk] ${msg}`);
     throw new Error(msg);

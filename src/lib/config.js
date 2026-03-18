@@ -1,8 +1,8 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const HOME = process.env.HOME || '/home/owen';
-export const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
+export const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 
 const DEFAULT_CONFIG = {

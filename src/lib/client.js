@@ -1,44 +1,11 @@
 import axios from 'axios';
 import { getCredentials } from './config.js';
+import { withRetry, isRetryable } from './retry.js';
 
 const DINGTALK_API_V1 = 'https://oapi.dingtalk.com';
 const DINGTALK_API_V2 = 'https://api.dingtalk.com';
 
 const TOKEN_REFRESH_MARGIN = 5 * 60 * 1000; // refresh 5 min before expiry
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY = 1000; // 1s, 2s, 4s
-
-/**
- * Check if an error is retryable (throttle or transient network).
- */
-function isRetryable(err) {
-  if (err.response?.status === 429) return true;
-  if (err.response?.data?.code === 'Throttling') return true;
-  const code = err.code;
-  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
-}
-
-/**
- * Execute an async function with exponential backoff retry on throttle/transient errors.
- */
-async function withRetry(fn, context = '') {
-  let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < MAX_RETRIES && isRetryable(err)) {
-        const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[dingtalk] ${context} retryable error (attempt ${attempt + 1}/${MAX_RETRIES}): ${err.message}. Retrying in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-      } else {
-        throw err;
-      }
-    }
-  }
-  throw lastErr;
-}
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -158,5 +125,5 @@ export async function apiRequestV2(method, apiPath, data = null, options = {}) {
   }, `V2 ${method} ${apiPath}`);
 }
 
-// Export for use in send.js standalone
+// Re-export for convenience
 export { withRetry, isRetryable };

@@ -7,11 +7,11 @@
  *   node admin.js <command> [args...]
  */
 
+import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
 
-const HOME = process.env.HOME || '/home/owen';
-dotenv.config({ path: path.join(HOME, 'zylos/.env') });
+dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
 import { getConfig, saveConfig } from './lib/config.js';
 

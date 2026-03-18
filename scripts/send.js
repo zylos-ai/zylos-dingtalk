@@ -13,49 +13,22 @@
  *   conversationId|type:group|msg:msgId  (group)
  */
 
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { withRetry, isRetryable, MAX_RETRIES } from '../src/lib/retry.js';
 
-const HOME = process.env.HOME || '/home/owen';
-dotenv.config({ path: path.join(HOME, 'zylos/.env') });
+dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
+const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
 const INTERNAL_PORT = 4460;
 const MAX_TEXT_LENGTH = 2000;
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY = 1000;
 const QUEUE_FILE = path.join(DATA_DIR, '.send-queue.json');
 const QUEUE_MAX = 10;
 const QUEUE_MAX_AGE_MS = 30 * 60 * 1000; // drop items older than 30 minutes
-
-function isRetryable(err) {
-  if (err.response?.status === 429) return true;
-  if (err.response?.data?.code === 'Throttling') return true;
-  const code = err.code;
-  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
-}
-
-async function withRetry(fn, context = '') {
-  let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (attempt < MAX_RETRIES && isRetryable(err)) {
-        const delay = RETRY_BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[dingtalk] ${context} retryable error (attempt ${attempt + 1}/${MAX_RETRIES}): ${err.message}. Retrying in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-      } else {
-        throw err;
-      }
-    }
-  }
-  throw lastErr;
-}
 
 // --- Parse args ---
 const [endpoint, ...msgParts] = process.argv.slice(2);
@@ -115,7 +88,7 @@ async function recordOutgoing(chatId, text) {
 const LOCK_FILE = QUEUE_FILE + '.lock';
 const LOCK_STALE_MS = 30000; // consider lock stale after 30s
 
-function acquireLock() {
+async function acquireLock() {
   const deadline = Date.now() + 5000; // wait up to 5s
   while (Date.now() < deadline) {
     try {
@@ -136,9 +109,8 @@ function acquireLock() {
       } catch {
         continue; // lock file disappeared, retry
       }
-      // Wait 50ms and retry
-      const start = Date.now();
-      while (Date.now() - start < 50) { /* spin */ }
+      // Yield to event loop instead of busy-waiting
+      await new Promise(r => setTimeout(r, 50));
     }
   }
   console.warn('[dingtalk] Queue lock timeout, proceeding without lock');
@@ -149,8 +121,11 @@ function releaseLock() {
   try { fs.unlinkSync(LOCK_FILE); } catch {}
 }
 
-function withLock(fn) {
-  acquireLock();
+// Clean up lock file on process exit
+process.on('exit', releaseLock);
+
+async function withLock(fn) {
+  await acquireLock();
   try {
     return fn();
   } finally {
@@ -171,8 +146,8 @@ function writeQueue(queue) {
   fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue), 'utf8');
 }
 
-function enqueue(item) {
-  withLock(() => {
+async function enqueue(item) {
+  await withLock(() => {
     const queue = readQueue();
     queue.push(item);
     while (queue.length > QUEUE_MAX) {
@@ -234,7 +209,7 @@ ${messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join('\n')}`;
 
 async function drainQueue() {
   // Atomically read and clear queue (short lock window)
-  const queue = withLock(() => {
+  const queue = await withLock(() => {
     const q = readQueue();
     if (q.length) writeQueue([]); // claim all items
     return q;
@@ -294,7 +269,7 @@ async function drainQueue() {
 
   // Write back failed items (merge with any new items added during drain)
   if (remaining.length > 0) {
-    withLock(() => {
+    await withLock(() => {
       const current = readQueue(); // may have new items from concurrent enqueue
       const merged = [...current, ...remaining];
       while (merged.length > QUEUE_MAX) merged.shift();
@@ -405,13 +380,15 @@ function hasMarkdown(text) {
 }
 
 // --- Send functions ---
+// DingTalk V1 responses use numeric errcode (0 = success).
+// V2 responses use string code (absent or "0" = success, non-zero string = error).
 function validateResponse(res, context) {
   if (res?.errcode && res.errcode !== 0) {
     const msg = `${context}: ${res.errmsg || 'unknown error'} (errcode=${res.errcode})`;
     console.error(`[dingtalk] ${msg}`);
     throw new Error(msg);
   }
-  if (res?.code && res.code !== 0) {
+  if (res?.code && String(res.code) !== '0') {
     const msg = `${context}: ${res.message || res.code}`;
     console.error(`[dingtalk] ${msg}`);
     throw new Error(msg);
@@ -532,13 +509,14 @@ async function sendMarkdownGroup(conversationId, title, text) {
 
 // --- Media sending ---
 async function sendMedia(ep, type, filePath) {
-  const token = await getAccessToken();
   const robotCode = process.env.DINGTALK_ROBOT_CODE;
+  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
   // Upload media first (recreate FormData on each retry — streams are single-use)
   const FormData = (await import('form-data')).default;
 
   const uploadRes = await withRetry(async () => {
+    const token = await getAccessToken();
     const form = new FormData();
     form.append('media', fs.createReadStream(filePath));
     const res = await axios.post('https://oapi.dingtalk.com/media/upload', form, {

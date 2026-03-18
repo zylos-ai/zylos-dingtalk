@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const HOME = process.env.HOME || '/home/owen';
-const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
+const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 
 console.log('[dingtalk post-upgrade] Running config migrations...');
