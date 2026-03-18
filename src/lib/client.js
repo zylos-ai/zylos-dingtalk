@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getCredentials } from './config.js';
+import { withRetry, isRetryable } from './retry.js';
 
 const DINGTALK_API_V1 = 'https://oapi.dingtalk.com';
 const DINGTALK_API_V2 = 'https://api.dingtalk.com';
@@ -47,29 +48,38 @@ export function resetToken() {
  * Token passed as query param.
  */
 export async function apiRequestV1(method, apiPath, data = null, options = {}) {
-  const token = await getAccessToken();
-  const axiosConfig = {
-    method,
-    url: `${DINGTALK_API_V1}${apiPath}`,
-    params: { access_token: token, ...(options.params || {}) },
-    timeout: options.timeout || 30000,
-  };
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const axiosConfig = {
+      method,
+      url: `${DINGTALK_API_V1}${apiPath}`,
+      params: { access_token: token, ...(options.params || {}) },
+      timeout: options.timeout || 30000,
+    };
 
-  if (data && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
-    axiosConfig.data = data;
-  }
+    if (data && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+      axiosConfig.data = data;
+    }
 
-  let res = await axios(axiosConfig);
+    let res = await axios(axiosConfig);
 
-  // Retry once on invalid token
-  if (res.data.errcode === 42001 || res.data.errcode === 40014) {
-    resetToken();
-    const freshToken = await getAccessToken();
-    axiosConfig.params.access_token = freshToken;
-    res = await axios(axiosConfig);
-  }
+    // Retry once on invalid token
+    if (res.data.errcode === 42001 || res.data.errcode === 40014) {
+      resetToken();
+      const freshToken = await getAccessToken();
+      axiosConfig.params.access_token = freshToken;
+      res = await axios(axiosConfig);
+    }
 
-  return res.data;
+    // Throw on throttling so withRetry can handle it
+    if (res.data.errcode === 88 || res.data.errmsg?.includes('Throttling')) {
+      const err = new Error(`Throttled: ${res.data.errmsg}`);
+      err.response = { status: 429, data: res.data };
+      throw err;
+    }
+
+    return res.data;
+  }, `V1 ${method} ${apiPath}`);
 }
 
 /**
@@ -77,21 +87,43 @@ export async function apiRequestV1(method, apiPath, data = null, options = {}) {
  * Token passed in header.
  */
 export async function apiRequestV2(method, apiPath, data = null, options = {}) {
-  const token = await getAccessToken();
-  const axiosConfig = {
-    method,
-    url: `${DINGTALK_API_V2}${apiPath}`,
-    headers: {
-      'x-acs-dingtalk-access-token': token,
-      ...(options.headers || {}),
-    },
-    timeout: options.timeout || 30000,
-  };
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const axiosConfig = {
+      method,
+      url: `${DINGTALK_API_V2}${apiPath}`,
+      headers: {
+        'x-acs-dingtalk-access-token': token,
+        ...(options.headers || {}),
+      },
+      timeout: options.timeout || 30000,
+    };
 
-  if (data && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
-    axiosConfig.data = data;
-  }
+    if (data && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+      axiosConfig.data = data;
+    }
 
-  let res = await axios(axiosConfig);
-  return res.data;
+    let res = await axios(axiosConfig);
+
+    // Retry once on invalid/expired token
+    if (res.data?.code === 'InvalidAuthentication' || res.data?.code === 'ForbiddenByDeniedPermission') {
+      console.warn(`[dingtalk] V2 token error (${res.data.code}), refreshing and retrying`);
+      resetToken();
+      const freshToken = await getAccessToken();
+      axiosConfig.headers['x-acs-dingtalk-access-token'] = freshToken;
+      res = await axios(axiosConfig);
+    }
+
+    // Throw on throttling so withRetry can handle it
+    if (res.data?.code === 'Throttling') {
+      const err = new Error(`Throttled: ${res.data.message || res.data.code}`);
+      err.response = { status: 429, data: res.data };
+      throw err;
+    }
+
+    return res.data;
+  }, `V2 ${method} ${apiPath}`);
 }
+
+// Re-export for convenience
+export { withRetry, isRetryable };

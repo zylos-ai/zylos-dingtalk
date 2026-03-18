@@ -13,17 +13,22 @@
  *   conversationId|type:group|msg:msgId  (group)
  */
 
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { withRetry, isRetryable, MAX_RETRIES } from '../src/lib/retry.js';
 
-const HOME = process.env.HOME || '/home/owen';
-dotenv.config({ path: path.join(HOME, 'zylos/.env') });
+dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
+const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
 const INTERNAL_PORT = 4460;
 const MAX_TEXT_LENGTH = 2000;
+const QUEUE_FILE = path.join(DATA_DIR, '.send-queue.json');
+const QUEUE_MAX = 10;
+const QUEUE_MAX_AGE_MS = 30 * 60 * 1000; // drop items older than 30 minutes
 
 // --- Parse args ---
 const [endpoint, ...msgParts] = process.argv.slice(2);
@@ -77,6 +82,211 @@ async function getSessionWebhook(ep) {
 
 async function recordOutgoing(chatId, text) {
   await internalRequest('/internal/record-outgoing', { chatId, text });
+}
+
+// --- File lock (prevents concurrent queue read/write race) ---
+const LOCK_FILE = QUEUE_FILE + '.lock';
+const LOCK_STALE_MS = 30000; // consider lock stale after 30s
+
+async function acquireLock() {
+  const deadline = Date.now() + 5000; // wait up to 5s
+  while (Date.now() < deadline) {
+    try {
+      // O_EXCL: atomic create, fails if file exists
+      const fd = fs.openSync(LOCK_FILE, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // Check if lock is stale
+      try {
+        const stat = fs.statSync(LOCK_FILE);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(LOCK_FILE);
+          continue; // retry immediately
+        }
+      } catch {
+        continue; // lock file disappeared, retry
+      }
+      // Yield to event loop instead of busy-waiting
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+  console.warn('[dingtalk] Queue lock timeout, proceeding without lock');
+  return false;
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE); } catch {}
+}
+
+// Clean up lock file on process exit
+process.on('exit', releaseLock);
+
+async function withLock(fn) {
+  await acquireLock();
+  try {
+    return fn();
+  } finally {
+    releaseLock();
+  }
+}
+
+// --- Send queue (file-based, survives across invocations) ---
+function readQueue() {
+  try {
+    return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function writeQueue(queue) {
+  fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue), 'utf8');
+}
+
+async function enqueue(item) {
+  await withLock(() => {
+    const queue = readQueue();
+    queue.push(item);
+    while (queue.length > QUEUE_MAX) {
+      const dropped = queue.shift();
+      console.warn(`[dingtalk] Queue full, dropped oldest message to ${parseEndpoint(dropped.endpoint).id}`);
+    }
+    writeQueue(queue);
+  });
+}
+
+// --- LLM merge for queued messages ---
+function runClaude(input) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('claude', ['-p', '--model', 'haiku'], {
+      env: { ...process.env, CLAUDE_BYPASS_PERMISSIONS: 'true' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => stdout += d);
+    proc.stderr.on('data', d => stderr += d);
+    proc.on('close', code => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(stderr || `claude exited with code ${code}`));
+    });
+    proc.on('error', reject);
+    const timer = setTimeout(() => { proc.kill(); reject(new Error('claude timeout')); }, 60000);
+    proc.on('close', () => clearTimeout(timer));
+    proc.stdin.write(input);
+    proc.stdin.end();
+  });
+}
+
+async function mergeMessages(messages) {
+  if (messages.length <= 1) return messages[0] || '';
+
+  const prompt = `You are a message merge assistant. Below are ${messages.length} messages that were delayed due to DingTalk service throttling. They were meant to be sent to the same recipient in order. Merge them into a single coherent message:
+- Remove duplicate or near-duplicate content
+- Preserve all unique information
+- Keep the original tone and language
+- If all messages are truly different, just join them with line breaks
+- Output ONLY the merged message, no explanation
+
+Messages:
+${messages.map((m, i) => `--- Message ${i + 1} ---\n${m}`).join('\n')}`;
+
+  try {
+    const result = await runClaude(prompt);
+    const merged = result.trim();
+    if (merged) return merged;
+  } catch (err) {
+    console.warn(`[dingtalk] LLM merge failed, using fallback: ${err.message}`);
+  }
+
+  // Fallback: simple dedup by joining unique messages
+  const unique = [...new Set(messages)];
+  return unique.join('\n\n');
+}
+
+async function drainQueue() {
+  // Atomically read and clear queue (short lock window)
+  const queue = await withLock(() => {
+    const q = readQueue();
+    if (q.length) writeQueue([]); // claim all items
+    return q;
+  });
+  if (!queue.length) return;
+
+  const now = Date.now();
+  const remaining = [];
+
+  // Separate valid items from expired, group by recipient
+  const groups = new Map(); // key -> { items, endpoint }
+  for (const item of queue) {
+    if (now - item.createdAt > QUEUE_MAX_AGE_MS) {
+      console.warn(`[dingtalk] Queue: expired message to ${parseEndpoint(item.endpoint).id} (age ${Math.round((now - item.createdAt) / 1000)}s)`);
+      continue;
+    }
+    const ep = parseEndpoint(item.endpoint);
+    const key = `${ep.id}|${ep.type || 'p2p'}`;
+    if (!groups.has(key)) groups.set(key, { items: [], endpoint: item.endpoint });
+    groups.get(key).items.push(item);
+  }
+
+  const deliveredGroups = []; // track for delay notice
+
+  for (const [, group] of groups) {
+    const { items, endpoint } = group;
+    const ep = parseEndpoint(endpoint);
+
+    // Merge messages if multiple for same recipient
+    let messageToSend;
+    if (items.length > 1) {
+      console.log(`[dingtalk] Queue: merging ${items.length} messages for ${ep.id}`);
+      messageToSend = await mergeMessages(items.map(i => i.message));
+    } else {
+      messageToSend = items[0].message;
+    }
+
+    try {
+      await sendMessage(endpoint, messageToSend);
+      deliveredGroups.push({ endpoint, count: items.length, oldestCreatedAt: items[0].createdAt });
+      console.log(`[dingtalk] Queue: delivered ${items.length} merged message(s) to ${ep.id}`);
+    } catch (err) {
+      // On failure, put all items back with incremented attempts
+      for (const item of items) {
+        item.attempts = (item.attempts || 0) + 1;
+        if (isRetryable(err) && item.attempts < MAX_RETRIES) {
+          remaining.push(item);
+        } else {
+          console.error(`[dingtalk] Queue: dropped message to ${ep.id} after ${item.attempts} drain attempts: ${err.message}`);
+        }
+      }
+      if (remaining.length > 0) {
+        console.warn(`[dingtalk] Queue: still failing for ${ep.id}, keeping ${items.length} item(s) in queue`);
+      }
+    }
+  }
+
+  // Write back failed items (merge with any new items added during drain)
+  if (remaining.length > 0) {
+    await withLock(() => {
+      const current = readQueue(); // may have new items from concurrent enqueue
+      const merged = [...current, ...remaining];
+      while (merged.length > QUEUE_MAX) merged.shift();
+      writeQueue(merged);
+    });
+  }
+
+  // Send delay notice for each recipient group
+  for (const { endpoint, oldestCreatedAt } of deliveredGroups) {
+    const delaySec = Math.round((now - oldestCreatedAt) / 1000);
+    const notice = `[提示] 以上消息因钉钉服务临时限流延迟了约 ${delaySec} 秒送达，已恢复正常。`;
+    try {
+      await sendMessage(endpoint, notice);
+    } catch {
+      // best-effort notice
+    }
+  }
 }
 
 // --- Token management (standalone, for when index.js is not running) ---
@@ -170,172 +380,254 @@ function hasMarkdown(text) {
 }
 
 // --- Send functions ---
-async function sendViaWebhook(webhookUrl, content) {
-  const token = await getAccessToken();
-  const body = { msgtype: 'text', text: { content } };
+// DingTalk V1 responses use numeric errcode (0 = success).
+// V2 responses use string code (absent or "0" = success, non-zero string = error).
+function validateResponse(res, context) {
+  if (res?.errcode && res.errcode !== 0) {
+    const msg = `${context}: ${res.errmsg || 'unknown error'} (errcode=${res.errcode})`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
+  }
+  if (res?.code && String(res.code) !== '0') {
+    const msg = `${context}: ${res.message || res.code}`;
+    console.error(`[dingtalk] ${msg}`);
+    throw new Error(msg);
+  }
+}
 
-  const res = await axios.post(webhookUrl, body, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+async function sendViaWebhook(webhookUrl, content) {
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const body = { msgtype: 'text', text: { content } };
+
+    const res = await axios.post(webhookUrl, body, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, 'Webhook text send');
+    return res.data;
+  }, 'webhook-text');
 }
 
 async function sendMarkdownViaWebhook(webhookUrl, title, text) {
-  const token = await getAccessToken();
-  const body = { msgtype: 'markdown', markdown: { title, text } };
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const body = { msgtype: 'markdown', markdown: { title, text } };
 
-  const res = await axios.post(webhookUrl, body, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+    const res = await axios.post(webhookUrl, body, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, 'Webhook markdown send');
+    return res.data;
+  }, 'webhook-markdown');
 }
 
 async function sendTextDM(userId, content) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-    robotCode,
-    userIds: [userId],
-    msgKey: 'sampleText',
-    msgParam: JSON.stringify({ content }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+      robotCode,
+      userIds: [userId],
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `DM text to ${userId}`);
+    console.log(`[dingtalk] DM text sent to ${userId}`);
+    return res.data;
+  }, `dm-text-${userId}`);
 }
 
 async function sendMarkdownDM(userId, title, text) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-    robotCode,
-    userIds: [userId],
-    msgKey: 'sampleMarkdown',
-    msgParam: JSON.stringify({ title, text }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+      robotCode,
+      userIds: [userId],
+      msgKey: 'sampleMarkdown',
+      msgParam: JSON.stringify({ title, text }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `DM markdown to ${userId}`);
+    console.log(`[dingtalk] DM markdown sent to ${userId}`);
+    return res.data;
+  }, `dm-markdown-${userId}`);
 }
 
 async function sendTextGroup(conversationId, content) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
-    robotCode,
-    openConversationId: conversationId,
-    msgKey: 'sampleText',
-    msgParam: JSON.stringify({ content }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+      robotCode,
+      openConversationId: conversationId,
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `Group text to ${conversationId}`);
+    console.log(`[dingtalk] Group text sent to ${conversationId}`);
+    return res.data;
+  }, `group-text-${conversationId}`);
 }
 
 async function sendMarkdownGroup(conversationId, title, text) {
-  const token = await getAccessToken();
-  const robotCode = process.env.DINGTALK_ROBOT_CODE;
-  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
+  return withRetry(async () => {
+    const token = await getAccessToken();
+    const robotCode = process.env.DINGTALK_ROBOT_CODE;
+    if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
-    robotCode,
-    openConversationId: conversationId,
-    msgKey: 'sampleMarkdown',
-    msgParam: JSON.stringify({ title, text }),
-  }, {
-    headers: { 'x-acs-dingtalk-access-token': token },
-    timeout: 15000,
-  });
-  return res.data;
+    const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+      robotCode,
+      openConversationId: conversationId,
+      msgKey: 'sampleMarkdown',
+      msgParam: JSON.stringify({ title, text }),
+    }, {
+      headers: { 'x-acs-dingtalk-access-token': token },
+      timeout: 15000,
+    });
+    validateResponse(res.data, `Group markdown to ${conversationId}`);
+    console.log(`[dingtalk] Group markdown sent to ${conversationId}`);
+    return res.data;
+  }, `group-markdown-${conversationId}`);
 }
 
 // --- Media sending ---
 async function sendMedia(ep, type, filePath) {
-  const token = await getAccessToken();
   const robotCode = process.env.DINGTALK_ROBOT_CODE;
+  if (!robotCode) throw new Error('Missing DINGTALK_ROBOT_CODE');
 
-  // Upload media first
+  // Upload media first (recreate FormData on each retry — streams are single-use)
   const FormData = (await import('form-data')).default;
-  const form = new FormData();
-  form.append('media', fs.createReadStream(filePath));
 
-  const uploadRes = await axios.post('https://oapi.dingtalk.com/media/upload', form, {
-    params: { access_token: token, type: type === 'image' ? 'image' : 'file' },
-    headers: form.getHeaders(),
-    timeout: 60000,
-  });
+  const uploadRes = await withRetry(async () => {
+    const token = await getAccessToken();
+    const form = new FormData();
+    form.append('media', fs.createReadStream(filePath));
+    const res = await axios.post('https://oapi.dingtalk.com/media/upload', form, {
+      params: { access_token: token, type: type === 'image' ? 'image' : 'file' },
+      headers: form.getHeaders(),
+      timeout: 60000,
+    });
+    if (res.data.errcode && res.data.errcode !== 0) {
+      throw new Error(`Upload failed: ${res.data.errmsg} (errcode=${res.data.errcode})`);
+    }
+    return res;
+  }, 'media-upload');
 
-  if (uploadRes.data.errcode && uploadRes.data.errcode !== 0) {
-    throw new Error(`Upload failed: ${uploadRes.data.errmsg}`);
-  }
+  console.log(`[dingtalk] Media uploaded: ${type}, mediaId=${uploadRes.data.media_id}`);
 
   const mediaId = uploadRes.data.media_id;
   const isGroup = ep.type === 'group';
 
   if (type === 'image') {
     if (isGroup) {
-      return sendGroup(ep.id, 'sampleImageMsg', JSON.stringify({ photoURL: mediaId }));
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+          robotCode, openConversationId: ep.id,
+          msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `Group image to ${ep.id}`);
+        console.log(`[dingtalk] Group image sent to ${ep.id}`);
+        return res.data;
+      }, `group-image-${ep.id}`);
     } else {
-      const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-        robotCode, userIds: [ep.id],
-        msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
-      }, {
-        headers: { 'x-acs-dingtalk-access-token': token },
-        timeout: 15000,
-      });
-      return res.data;
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+          robotCode, userIds: [ep.id],
+          msgKey: 'sampleImageMsg', msgParam: JSON.stringify({ photoURL: mediaId }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `DM image to ${ep.id}`);
+        console.log(`[dingtalk] DM image sent to ${ep.id}`);
+        return res.data;
+      }, `dm-image-${ep.id}`);
     }
   } else {
     const fileName = path.basename(filePath);
     const fileType = path.extname(filePath).slice(1) || 'file';
     if (isGroup) {
-      return sendGroup(ep.id, 'sampleFile', JSON.stringify({ mediaId, fileName, fileType }));
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
+          robotCode, openConversationId: ep.id,
+          msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `Group file to ${ep.id}`);
+        console.log(`[dingtalk] Group file sent to ${ep.id}`);
+        return res.data;
+      }, `group-file-${ep.id}`);
     } else {
-      const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-        robotCode, userIds: [ep.id],
-        msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
-      }, {
-        headers: { 'x-acs-dingtalk-access-token': token },
-        timeout: 15000,
-      });
-      return res.data;
+      return withRetry(async () => {
+        const t = await getAccessToken();
+        const res = await axios.post('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+          robotCode, userIds: [ep.id],
+          msgKey: 'sampleFile', msgParam: JSON.stringify({ mediaId, fileName, fileType }),
+        }, {
+          headers: { 'x-acs-dingtalk-access-token': t },
+          timeout: 15000,
+        });
+        validateResponse(res.data, `DM file to ${ep.id}`);
+        console.log(`[dingtalk] DM file sent to ${ep.id}`);
+        return res.data;
+      }, `dm-file-${ep.id}`);
     }
   }
 }
 
-// --- Main send logic ---
-async function run() {
-  const ep = parseEndpoint(endpoint);
+// --- Core send logic (used by both direct sends and queue drain) ---
+async function sendMessage(endpointStr, msg) {
+  const ep = parseEndpoint(endpointStr);
   const isGroup = ep.type === 'group';
 
   // Check for media
-  const mediaMatch = message.match(/^\[MEDIA:(\w+)\](.+)$/);
+  const mediaMatch = msg.match(/^\[MEDIA:(\w+)\](.+)$/);
   if (mediaMatch) {
     const [, mediaType, mediaPath] = mediaMatch;
     await sendMedia(ep, mediaType, mediaPath.trim());
-    console.log(`[dingtalk] Media sent: ${mediaType}`);
+    console.log(`[dingtalk] Media ${mediaType} sent to ${ep.id} (${ep.type || 'DM'})`);
     return;
   }
 
   // Text message — chunk and send
-  const chunks = chunkMessage(message);
+  const chunks = chunkMessage(msg);
 
   // Try sessionWebhook first (fastest, works for replies)
-  const webhookUrl = await getSessionWebhook(endpoint);
+  const webhookUrl = await getSessionWebhook(endpointStr);
 
-  for (let i = 0; i < chunks.length; i++) {
+  const totalChunks = chunks.length;
+  if (totalChunks > 1) {
+    console.log(`[dingtalk] Sending ${totalChunks} chunks to ${ep.id} (${isGroup ? 'group' : 'DM'})`);
+  }
+
+  for (let i = 0; i < totalChunks; i++) {
     const chunk = chunks[i];
+    const chunkLabel = totalChunks > 1 ? ` [${i + 1}/${totalChunks}]` : '';
     let sent = false;
 
     // Try webhook reply first
@@ -347,8 +639,9 @@ async function run() {
           await sendViaWebhook(webhookUrl, chunk);
         }
         sent = true;
+        if (totalChunks > 1) console.log(`[dingtalk] Chunk${chunkLabel} sent via webhook`);
       } catch (err) {
-        console.error(`[dingtalk] Webhook reply failed, falling back to API: ${err.message}`);
+        console.error(`[dingtalk] Webhook reply failed${chunkLabel}, falling back to API: ${err.message}`);
       }
     }
 
@@ -367,22 +660,40 @@ async function run() {
           await sendTextDM(ep.id, chunk);
         }
       }
+      if (totalChunks > 1) console.log(`[dingtalk] Chunk${chunkLabel} sent via API`);
     }
 
     // Delay between chunks
-    if (i < chunks.length - 1) {
+    if (i < totalChunks - 1) {
       await new Promise(r => setTimeout(r, 500));
     }
   }
 
   // Record outgoing to history
-  const chatId = isGroup ? ep.id : ep.id;
-  await recordOutgoing(chatId, message.slice(0, 4000));
+  await recordOutgoing(ep.id, msg.slice(0, 4000));
 
-  console.log(`[dingtalk] Sent ${chunks.length} chunk(s) to ${ep.id}`);
+  console.log(`[dingtalk] Sent ${totalChunks} chunk(s) to ${ep.id} (${isGroup ? 'group' : 'DM'})`);
 }
 
-run().catch(err => {
+// --- Main entry point ---
+async function main() {
+  // Drain queued messages first
+  await drainQueue();
+
+  // Send current message
+  try {
+    await sendMessage(endpoint, message);
+  } catch (err) {
+    if (isRetryable(err)) {
+      enqueue({ endpoint, message, attempts: 0, createdAt: Date.now() });
+      console.warn(`[dingtalk] Send failed (retryable), queued for later delivery: ${err.message}`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+main().catch(err => {
   console.error(`[dingtalk] Send failed: ${err.message}`);
   process.exit(1);
 });

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const HOME = process.env.HOME || '/home/owen';
-const DATA_DIR = path.join(HOME, 'zylos/components/dingtalk');
+const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
 
 const DEFAULT_CONFIG = {
   enabled: true,
@@ -37,7 +37,7 @@ if (!fs.existsSync(configPath)) {
 }
 
 // Check environment
-const envPath = path.join(HOME, 'zylos/.env');
+const envPath = path.join(os.homedir(), 'zylos/.env');
 if (fs.existsSync(envPath)) {
   const env = fs.readFileSync(envPath, 'utf8');
   const missing = [];

@@ -1,3 +1,4 @@
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -8,10 +9,9 @@ import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { getUserInfo } from './lib/contact.js';
 
-const HOME = process.env.HOME || '/home/owen';
-dotenv.config({ path: path.join(HOME, 'zylos/.env') });
+dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const C4_RECEIVE = path.join(HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const C4_RECEIVE = path.join(os.homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 
@@ -413,6 +413,28 @@ watchConfig((newConfig) => {
   }
 });
 
+// --- Private IP detection ---
+function isPrivateIP(hostname) {
+  // Check for RFC 1918 private addresses and other non-routable ranges
+  const privatePatterns = [
+    /^10\./,                          // 10.0.0.0/8
+    /^172\.(1[6-9]|2\d|3[01])\./,    // 172.16.0.0/12
+    /^192\.168\./,                    // 192.168.0.0/16
+    /^127\./,                         // 127.0.0.0/8 (loopback)
+    /^169\.254\./,                    // 169.254.0.0/16 (link-local)
+  ];
+  return privatePatterns.some(p => p.test(hostname));
+}
+
+function extractHostFromURL(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname;
+  } catch {
+    return null;
+  }
+}
+
 // --- Main ---
 async function main() {
   console.log(`[dingtalk] Starting... Data dir: ${DATA_DIR}`);
@@ -445,10 +467,28 @@ async function main() {
     return { status: 'SUCCESS' };
   });
 
-  // Connect
+  // Connect with private IP detection — retry if gateway returns a private IP
+  const MAX_ENDPOINT_RETRIES = 3;
   try {
-    await streamClient.connect();
-    console.log('[dingtalk] Stream connected');
+    for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+      await streamClient.getEndpoint();
+      const host = extractHostFromURL(streamClient.dw_url);
+      if (host && isPrivateIP(host)) {
+        console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      // _connect() is a private method of dingtalk-stream DWClient.
+      // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
+      await streamClient._connect();
+      console.log('[dingtalk] Stream connected');
+      return;
+    }
+    // All retries got private IPs, try connecting anyway as last resort
+    console.warn('[dingtalk] All endpoint retries returned private IPs, attempting connection anyway');
+    // See version note above re: _connect()
+    await streamClient._connect();
+    console.log('[dingtalk] Stream connected (private IP fallback)');
   } catch (err) {
     console.error('[dingtalk] Stream connection failed:', err.message);
     process.exit(1);
