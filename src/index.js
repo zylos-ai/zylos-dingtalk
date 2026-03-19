@@ -205,10 +205,10 @@ async function handleBotMessage(res) {
   try {
     msg = JSON.parse(res.data);
   } catch (err) {
-    const payloadPreview = typeof res.data === 'string'
-      ? res.data.slice(0, 300)
-      : '[non-string payload]';
-    console.error(`[dingtalk] Failed to parse message data: ${err.message}. Acking OK to avoid redelivery. payload=${payloadPreview}`);
+    const payloadMeta = typeof res.data === 'string'
+      ? `type=string, len=${res.data.length}`
+      : `type=${typeof res.data}`;
+    console.error(`[dingtalk] Failed to parse message data: ${err.message}. Acking OK to avoid redelivery. (${payloadMeta})`);
     // Malformed payloads are non-recoverable for this worker; ACK OK to avoid retry storms.
     try {
       streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
@@ -379,7 +379,7 @@ async function handleBotMessage(res) {
     // Forward to C4
     forwardToC4('dingtalk', replyEndpoint, c4Content);
 
-    console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName}: ${contentText.slice(0, 80)}`);
+    console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName} (msgtype=${msgtype}, len=${contentText.length})`);
   } finally {
     // Always recall thinking emoji, even if processing fails
     recallThinkingEmoji(robotCode, msgId, conversationId);
