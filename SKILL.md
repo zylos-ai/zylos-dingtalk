@@ -1,6 +1,6 @@
 ---
 name: dingtalk
-version: 0.1.1
+version: 0.1.2
 description: >
   DingTalk (钉钉) communication channel. Receives messages via Stream mode
   (WebSocket) and sends messages via DingTalk REST API. Use when:
@@ -60,12 +60,18 @@ Connects DingTalk (钉钉) to the Zylos agent via C4 Communication Bridge.
 - Owner auto-binding on first DM
 - Access control (DM policy + group allowlists)
 - Media upload/download (images, files)
+- File content extraction (PDF, docx, txt)
 - Markdown card rendering
+- Thinking emoji reaction with 3s minimum display
 - Message context history for groups
+- Resilient connection: 503 retry, null endpoint tolerance, auto-reconnect
+- Connection health watchdog (30s interval, 3min timeout)
+- WebSocket close/error event-driven reconnect
 - Exponential backoff retry for transient/throttle errors
 - File-based send queue (max 10, 30min TTL, FIFO) for offline delivery
 - LLM-powered message merging for queued messages
 - Private IP detection for DingTalk gateway endpoint
+- Log sanitization (no user content in logs)
 
 ## Admin CLI
 ```bash

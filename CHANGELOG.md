@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-03-19
+
+### Added
+- Resilient connection: 503 fuse retry, null endpoint tolerance, auto-reconnect with exponential backoff
+- Full reconnection ownership — SDK `autoReconnect` disabled; all retry logic managed internally
+- WebSocket open-event confirmation before declaring connection success
+- WebSocket close/error event listeners for immediate disconnect detection
+- Connection health watchdog (30s check interval, 3min idle timeout, WebSocket ping)
+- Thinking emoji reaction shown while processing, with 3s minimum display time
+- File content extraction for PDF, docx, and plain text attachments (mammoth + pdf-parse)
+- Streaming file download with 50MB size limit
+- Malformed message ACK to prevent DingTalk redelivery storms
+- Log sanitization — user message content redacted from logs (only msgtype + length shown)
+- 103 regression tests covering all resilience scenarios
+
+### Changed
+- `connectWithRetry` replaces single-attempt connect (up to 10 outer × 5 inner retries)
+- `uncaughtException` and `unhandledRejection` handlers now trigger reconnect for stream errors instead of crashing
+- Graceful shutdown cleans up watchdog, media cache, and socket listeners
+
 ## [0.1.1] - 2026-03-18
 
 ### Added
