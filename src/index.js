@@ -8,7 +8,13 @@ import { execFile } from 'child_process';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { getUserInfo } from './lib/contact.js';
-import { addThinkingEmoji, recallThinkingEmoji, downloadFileByCode, extractFileContent } from './lib/message.js';
+import {
+  addThinkingEmoji,
+  recallThinkingEmoji,
+  downloadFileByCode,
+  extractFileContent,
+  cleanupMediaCache,
+} from './lib/message.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -20,6 +26,7 @@ const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 let config = getConfig();
 let streamClient = null;
 let internalServer = null;
+let mediaCleanupInterval = null;
 
 // Deduplication: msgId -> timestamp
 const processedMessages = new Map();
@@ -224,12 +231,14 @@ async function handleBotMessage(res) {
     return;
   }
 
-  // Resolve user name (prefer senderNick, fallback to API)
-  const userName = senderNick || await resolveUserName(senderStaffId);
-
   // conversationType: "1" = 1:1 DM, "2" = group
   const isGroup = conversationType === '2';
   const isDM = !isGroup;
+  let userName = senderNick || String(senderStaffId || 'Unknown');
+
+  // ACK as early as possible to avoid DingTalk 60s redelivery.
+  // Any downstream failure is handled internally and should not trigger resend storms.
+  streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
 
   // Permission check
   if (isDM) {
@@ -239,25 +248,26 @@ async function handleBotMessage(res) {
     }
     if (!checkDMPermission(senderStaffId)) {
       console.log(`[dingtalk] DM denied: ${userName} (${senderStaffId})`);
-      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
       return;
     }
   } else {
     if (!checkGroupPermission(senderStaffId, conversationId)) {
       console.log(`[dingtalk] Group denied: ${userName} in ${conversationTitle}`);
-      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
       return;
     }
   }
 
-  // ACK immediately to prevent DingTalk 60s redelivery
-  streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
-
-  // Add thinking emoji (non-blocking, silently fails)
+  // Add thinking emoji before handling body content.
+  // The helper swallows errors, so await here only ensures ordering.
   const robotCode = creds.robot_code || creds.app_key;
-  addThinkingEmoji(robotCode, msgId, conversationId);
+  await addThinkingEmoji(robotCode, msgId, conversationId);
 
   try {
+    // Resolve user name (prefer senderNick, fallback to API) after ACK
+    if (!senderNick && senderStaffId) {
+      userName = await resolveUserName(senderStaffId);
+    }
+
     // Extract content based on msgtype
     let contentText = '';
     let fileContent = null;
@@ -282,15 +292,27 @@ async function handleBotMessage(res) {
         break;
       case 'file': {
         // Download and extract file content
-        const fileName = msg.fileName || msg.content?.fileName || 'file';
-        const downloadCode = msg.downloadCode || msg.content?.downloadCode;
+        let fileInfo = {};
+        if (msg.content && typeof msg.content === 'object') {
+          fileInfo = msg.content;
+        } else if (typeof msg.content === 'string') {
+          try {
+            fileInfo = JSON.parse(msg.content);
+          } catch {
+            // Keep best-effort behavior: top-level fields may still be present.
+          }
+        }
+
+        const fileNameRaw = msg.fileName ?? fileInfo.fileName ?? fileInfo.file_name ?? 'file';
+        const fileName = path.basename(String(fileNameRaw));
+        const downloadCode = msg.downloadCode ?? fileInfo.downloadCode ?? fileInfo.download_code;
         contentText = `[文件: ${fileName}]`;
 
         if (downloadCode) {
           try {
             const localPath = await downloadFileByCode(downloadCode, fileName);
             mediaPath = localPath;
-            const extracted = await extractFileContent(localPath);
+            const extracted = await extractFileContent(localPath, fileName);
             if (extracted) {
               fileContent = extracted;
             } else {
@@ -512,6 +534,12 @@ async function main() {
 
   // Start the connection health watchdog
   startWatchdog();
+
+  // Best-effort media cache cleanup to avoid disk growth from downloaded files.
+  cleanupMediaCache({ silent: true });
+  mediaCleanupInterval = setInterval(() => {
+    cleanupMediaCache({ silent: true });
+  }, 10 * 60 * 1000);
 }
 
 // --- Resilient connection ---
@@ -797,6 +825,8 @@ async function shutdown() {
   clearInterval(dedupCleanupInterval);
   clearInterval(userCachePersistInterval);
   if (watchdogTimer) clearInterval(watchdogTimer);
+  if (mediaCleanupInterval) clearInterval(mediaCleanupInterval);
+  cleanupMediaCache({ silent: true });
   persistUserCache();
 
   if (streamClient) {
