@@ -205,9 +205,14 @@ async function handleBotMessage(res) {
   try {
     msg = JSON.parse(res.data);
   } catch (err) {
-    console.error('[dingtalk] Failed to parse message data:', err.message);
-    // ACK to prevent retry
-    streamClient.socketCallBackResponse(res.headers.messageId, { status: 'FAIL' });
+    const payloadPreview = typeof res.data === 'string'
+      ? res.data.slice(0, 300)
+      : '[non-string payload]';
+    console.error(`[dingtalk] Failed to parse message data: ${err.message}. Acking OK to avoid redelivery. payload=${payloadPreview}`);
+    // Malformed payloads are non-recoverable for this worker; ACK OK to avoid retry storms.
+    try {
+      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
+    } catch {}
     return;
   }
 
