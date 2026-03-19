@@ -444,14 +444,20 @@ async function main() {
   internalServer = startInternalServer(internalPort);
 
   // Create stream client
+  // IMPORTANT: autoReconnect MUST be false — the SDK's built-in reconnect
+  // calls connect() directly, bypassing our private IP detection, 503 retry,
+  // and null endpoint handling. We manage all reconnection ourselves.
   streamClient = new DWClient({
     clientId: creds.app_key,
     clientSecret: creds.app_secret,
+    autoReconnect: false,
+    keepAlive: false,
     debug: false,
   });
 
   // Register bot message handler
   streamClient.registerCallbackListener(TOPIC_ROBOT, async (res) => {
+    lastActivityTime = Date.now();
     try {
       await handleBotMessage(res);
     } catch (err) {
@@ -462,97 +468,200 @@ async function main() {
     }
   });
 
-  // Register generic event handler
+  // Register generic event handler (system messages, keepalive, etc.)
   streamClient.registerAllEventListener((msg) => {
+    lastActivityTime = Date.now();
     return { status: 'SUCCESS' };
   });
 
   // Connect with resilient retry logic
   await connectWithRetry();
+
+  // Start the connection health watchdog
+  startWatchdog();
 }
 
 // --- Resilient connection ---
-const MAX_ENDPOINT_RETRIES = 3;
-const MAX_CONNECT_RETRIES = 5;
-const RECONNECT_BASE_DELAY = 3000; // 3s, 6s, 12s, 24s, 48s
+const MAX_ENDPOINT_RETRIES = 5;
+const MAX_CONNECT_RETRIES = 10;
+const RECONNECT_BASE_DELAY = 3000;       // 3s base, exponential: 3s, 6s, 12s, 24s, 48s...
+const RECONNECT_MAX_DELAY = 5 * 60000;   // cap at 5 minutes
+const WATCHDOG_INTERVAL = 30000;          // check every 30s
+const WATCHDOG_TIMEOUT = 3 * 60000;      // 3 minutes no activity = stale
 let reconnecting = false;
+let lastActivityTime = Date.now();
+let watchdogTimer = null;
 
-async function connectWithRetry(retryCount = 0) {
+/**
+ * Get the endpoint from DingTalk gateway, with retry for transient failures.
+ * Returns true if a valid endpoint was obtained, false if all retries failed.
+ */
+async function getEndpointWithRetry() {
   for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+    // Get endpoint
     try {
       await streamClient.getEndpoint();
     } catch (err) {
       const status = err.response?.status;
       const code = err.response?.data?.code;
-      // Handle 503 fuse / ServiceUnavailable
-      if (status === 503 || code === 'ServiceUnavailable') {
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[dingtalk] Gateway 503 (fused), retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      // Handle transient network errors
-      if (['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code)) {
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[dingtalk] Gateway network error (${err.code}), retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
+      const isTransient = status === 503 || code === 'ServiceUnavailable'
+        || ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code);
+
+      if (isTransient && attempt < MAX_ENDPOINT_RETRIES - 1) {
+        const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
+        console.warn(`[dingtalk] getEndpoint error (${err.code || status || code}), retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
       throw err;
     }
 
-    // Check for null endpoint/ticket
+    // Validate: null endpoint
     if (!streamClient.dw_url) {
-      const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-      console.warn(`[dingtalk] Gateway returned null endpoint, retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
-      await new Promise(r => setTimeout(r, delay));
-      continue;
-    }
-
-    // Check for private IP
-    const host = extractHostFromURL(streamClient.dw_url);
-    if (host && isPrivateIP(host)) {
-      console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
-      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-      continue;
-    }
-
-    // _connect() is a private method of dingtalk-stream DWClient.
-    // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
-    try {
-      await streamClient._connect();
-      console.log('[dingtalk] Stream connected');
-      return;
-    } catch (connectErr) {
-      console.error(`[dingtalk] _connect() failed: ${connectErr.message}`);
       if (attempt < MAX_ENDPOINT_RETRIES - 1) {
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[dingtalk] Retrying connection in ${delay}ms`);
+        const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
+        console.warn(`[dingtalk] Gateway returned null endpoint, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      throw connectErr;
+      throw new Error('Gateway returned null endpoint after all retries');
     }
-  }
 
-  // All endpoint retries exhausted
-  if (retryCount < MAX_CONNECT_RETRIES) {
-    const delay = RECONNECT_BASE_DELAY * Math.pow(2, retryCount);
-    console.warn(`[dingtalk] All endpoint retries failed, full retry ${retryCount + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
-    await new Promise(r => setTimeout(r, delay));
-    return connectWithRetry(retryCount + 1);
-  }
+    // Validate: private IP
+    const host = extractHostFromURL(streamClient.dw_url);
+    if (host && isPrivateIP(host)) {
+      if (attempt < MAX_ENDPOINT_RETRIES - 1) {
+        console.warn(`[dingtalk] Gateway returned private IP ${host}, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES}`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      console.warn(`[dingtalk] All retries returned private IPs, proceeding with ${host} as last resort`);
+    }
 
-  throw new Error('All connection retries exhausted');
+    return; // endpoint is valid
+  }
 }
 
+/**
+ * Establish WebSocket connection and wait for it to actually open.
+ * SDK's _connect() resolves immediately (before socket opens), so we
+ * listen for the 'open' event ourselves.
+ */
+function connectSocket() {
+  return new Promise((resolve, reject) => {
+    // _connect() is a private method of dingtalk-stream DWClient.
+    // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
+    streamClient._connect();
+
+    const socket = streamClient.socket;
+    if (!socket) {
+      reject(new Error('No socket created by _connect()'));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('WebSocket open timeout (15s)'));
+    }, 15000);
+
+    function onOpen() {
+      cleanup();
+      resolve();
+    }
+    function onError(err) {
+      cleanup();
+      reject(err || new Error('WebSocket error during connect'));
+    }
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`WebSocket closed during connect (code: ${code})`));
+    }
+    function cleanup() {
+      clearTimeout(timeout);
+      socket.removeListener('open', onOpen);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    }
+
+    socket.on('open', onOpen);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+  });
+}
+
+/**
+ * Attach persistent event listeners to the current WebSocket for
+ * disconnect detection. Called after each successful connection.
+ */
+function attachSocketListeners() {
+  const socket = streamClient.socket;
+  if (!socket) return;
+
+  socket.on('close', (code, reason) => {
+    const reasonStr = reason?.toString() || 'unknown';
+    console.warn(`[dingtalk] WebSocket closed (code: ${code}, reason: ${reasonStr})`);
+    streamClient.connected = false;
+    scheduleReconnect(`socket close (code: ${code})`);
+  });
+
+  socket.on('error', (err) => {
+    console.error(`[dingtalk] WebSocket error: ${err.message}`);
+    // Don't reconnect here — 'close' always fires after 'error'
+  });
+
+  socket.on('pong', () => {
+    lastActivityTime = Date.now();
+  });
+
+  socket.on('message', () => {
+    lastActivityTime = Date.now();
+  });
+}
+
+/**
+ * Full connection flow: get endpoint → connect socket → attach listeners.
+ * Retries the entire flow up to MAX_CONNECT_RETRIES times.
+ */
+async function connectWithRetry(retryCount = 0) {
+  // Clean up any existing connection first
+  try {
+    if (streamClient.socket) {
+      streamClient.socket.removeAllListeners('close');
+      streamClient.socket.removeAllListeners('error');
+      streamClient.userDisconnect = true; // prevent SDK auto-reconnect if still enabled
+      streamClient.socket.close();
+    }
+  } catch {}
+
+  try {
+    await getEndpointWithRetry();
+    await connectSocket();
+    lastActivityTime = Date.now();
+    attachSocketListeners();
+    console.log('[dingtalk] Stream connected and listeners attached');
+    return;
+  } catch (err) {
+    if (retryCount < MAX_CONNECT_RETRIES - 1) {
+      const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, retryCount), RECONNECT_MAX_DELAY);
+      console.error(`[dingtalk] Connection failed: ${err.message}. Full retry ${retryCount + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
+      await new Promise(r => setTimeout(r, delay));
+      return connectWithRetry(retryCount + 1);
+    }
+    throw new Error(`All connection retries exhausted (last: ${err.message})`);
+  }
+}
+
+/**
+ * Schedule reconnection after connection loss.
+ * Idempotent — concurrent calls are deduplicated via `reconnecting` flag.
+ */
 async function scheduleReconnect(reason) {
   if (reconnecting) return;
   reconnecting = true;
   console.warn(`[dingtalk] Connection lost (${reason}), scheduling reconnect...`);
 
   for (let i = 0; i < MAX_CONNECT_RETRIES; i++) {
-    const delay = RECONNECT_BASE_DELAY * Math.pow(2, i);
+    const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, i), RECONNECT_MAX_DELAY);
     console.log(`[dingtalk] Reconnect attempt ${i + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
     await new Promise(r => setTimeout(r, delay));
 
@@ -571,16 +680,59 @@ async function scheduleReconnect(reason) {
   process.exit(1);
 }
 
+/**
+ * Connection health watchdog.
+ * Checks every 30s whether we've received any data recently.
+ * If no activity for 3 minutes, the connection is likely stale — force reconnect.
+ * Also sends WebSocket ping to check for zombie connections.
+ */
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+
+  watchdogTimer = setInterval(() => {
+    if (reconnecting) return; // don't interfere with active reconnection
+
+    const elapsed = Date.now() - lastActivityTime;
+
+    // Send WebSocket-level ping to keep connection alive and detect zombies
+    try {
+      if (streamClient.socket?.readyState === 1) { // OPEN
+        streamClient.socket.ping();
+      }
+    } catch {}
+
+    // Check for stale connection
+    if (elapsed > WATCHDOG_TIMEOUT) {
+      console.warn(`[dingtalk] Watchdog: no activity for ${Math.round(elapsed / 1000)}s, forcing reconnect`);
+      scheduleReconnect(`watchdog timeout (${Math.round(elapsed / 1000)}s idle)`);
+      return;
+    }
+
+    // Check socket state
+    const state = streamClient.socket?.readyState;
+    if (state !== undefined && state !== 1) { // not OPEN
+      const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+      console.warn(`[dingtalk] Watchdog: socket state is ${stateNames[state] || state}, forcing reconnect`);
+      scheduleReconnect(`socket state: ${stateNames[state] || state}`);
+    }
+  }, WATCHDOG_INTERVAL);
+}
+
 // --- Graceful shutdown ---
 async function shutdown() {
   console.log('[dingtalk] Shutting down...');
   stopWatching();
   clearInterval(dedupCleanupInterval);
   clearInterval(userCachePersistInterval);
+  if (watchdogTimer) clearInterval(watchdogTimer);
   persistUserCache();
 
   if (streamClient) {
-    try { streamClient.disconnect(); } catch {}
+    try {
+      // Remove close listeners to prevent reconnect during shutdown
+      streamClient.socket?.removeAllListeners('close');
+      streamClient.disconnect();
+    } catch {}
   }
   if (internalServer) {
     internalServer.close();
