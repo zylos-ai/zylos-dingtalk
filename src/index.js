@@ -8,6 +8,7 @@ import { execFile } from 'child_process';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { getUserInfo } from './lib/contact.js';
+import { addThinkingEmoji, recallThinkingEmoji, downloadFileByCode, extractFileContent } from './lib/message.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -249,81 +250,113 @@ async function handleBotMessage(res) {
     }
   }
 
-  // Extract content based on msgtype
-  let contentText = '';
-  let mediaPath = null;
-
-  switch (msgtype) {
-    case 'text':
-      contentText = text?.content?.trim() || '';
-      break;
-    case 'richText':
-      contentText = '[rich text message]';
-      break;
-    case 'picture':
-      contentText = '[image]';
-      // TODO: download image if URL available in msg
-      break;
-    case 'video':
-      contentText = '[video]';
-      break;
-    case 'audio':
-      contentText = '[audio]';
-      break;
-    case 'file':
-      contentText = '[file]';
-      break;
-    default:
-      contentText = `[${msgtype || 'unknown'}]`;
-  }
-
-  if (!contentText) {
-    streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
-    return;
-  }
-
-  // Record to history
-  recordHistory(conversationId, {
-    msgId,
-    userId: senderStaffId,
-    userName,
-    text: contentText,
-    timestamp: new Date().toISOString(),
-  });
-
-  // Build C4 message
-  const replyEndpoint = isGroup
-    ? `${conversationId}|type:group|msg:${msgId}`
-    : `${senderStaffId}|type:p2p|msg:${msgId}`;
-
-  // Store sessionWebhook in a temp map so send.js can use it
-  storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
-
-  let c4Content = '';
-
-  if (isDM) {
-    c4Content = `[DingTalk DM] ${userName} said: ${contentText}`;
-  } else {
-    const context = getContextMessages(conversationId, msgId);
-    let contextStr = '';
-    if (context.length > 0) {
-      contextStr = '\n\n--- recent context ---\n' +
-        context.map(m => `${m.userName}: ${m.text}`).join('\n');
-    }
-    c4Content = `[DingTalk GROUP:${conversationTitle || conversationId}] ${userName} said: ${contentText}${contextStr}`;
-  }
-
-  if (mediaPath) {
-    c4Content += ` ---- file: ${mediaPath}`;
-  }
-
-  // Forward to C4
-  forwardToC4('dingtalk', replyEndpoint, c4Content);
-
-  // ACK
+  // ACK immediately to prevent DingTalk 60s redelivery
   streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
 
-  console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName}: ${contentText.slice(0, 80)}`);
+  // Add thinking emoji (non-blocking, silently fails)
+  const robotCode = creds.robot_code || creds.app_key;
+  addThinkingEmoji(robotCode, msgId, conversationId);
+
+  try {
+    // Extract content based on msgtype
+    let contentText = '';
+    let fileContent = null;
+    let mediaPath = null;
+
+    switch (msgtype) {
+      case 'text':
+        contentText = text?.content?.trim() || '';
+        break;
+      case 'richText':
+        contentText = '[rich text message]';
+        break;
+      case 'picture':
+        contentText = '[image]';
+        // TODO: download image if URL available in msg
+        break;
+      case 'video':
+        contentText = '[video]';
+        break;
+      case 'audio':
+        contentText = '[audio]';
+        break;
+      case 'file': {
+        // Download and extract file content
+        const fileName = msg.fileName || msg.content?.fileName || 'file';
+        const downloadCode = msg.downloadCode || msg.content?.downloadCode;
+        contentText = `[文件: ${fileName}]`;
+
+        if (downloadCode) {
+          try {
+            const localPath = await downloadFileByCode(downloadCode, fileName);
+            mediaPath = localPath;
+            const extracted = await extractFileContent(localPath);
+            if (extracted) {
+              fileContent = extracted;
+            } else {
+              fileContent = `[文件已保存: ${fileName}，不支持内容提取]`;
+            }
+          } catch (err) {
+            console.error(`[dingtalk] File download/extract failed: ${err.message}`);
+            fileContent = `[文件下载失败: ${fileName}]`;
+          }
+        }
+        break;
+      }
+      default:
+        contentText = `[${msgtype || 'unknown'}]`;
+    }
+
+    if (!contentText) return;
+
+    // Record to history
+    recordHistory(conversationId, {
+      msgId,
+      userId: senderStaffId,
+      userName,
+      text: contentText,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Build C4 message
+    const replyEndpoint = isGroup
+      ? `${conversationId}|type:group|msg:${msgId}`
+      : `${senderStaffId}|type:p2p|msg:${msgId}`;
+
+    // Store sessionWebhook in a temp map so send.js can use it
+    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
+
+    let c4Content = '';
+
+    if (isDM) {
+      c4Content = `[DingTalk DM] ${userName} said: ${contentText}`;
+    } else {
+      const context = getContextMessages(conversationId, msgId);
+      let contextStr = '';
+      if (context.length > 0) {
+        contextStr = '\n\n--- recent context ---\n' +
+          context.map(m => `${m.userName}: ${m.text}`).join('\n');
+      }
+      c4Content = `[DingTalk GROUP:${conversationTitle || conversationId}] ${userName} said: ${contentText}${contextStr}`;
+    }
+
+    // Append extracted file content
+    if (fileContent) {
+      c4Content += `\n\n${fileContent}`;
+    }
+
+    if (mediaPath) {
+      c4Content += ` ---- file: ${mediaPath}`;
+    }
+
+    // Forward to C4
+    forwardToC4('dingtalk', replyEndpoint, c4Content);
+
+    console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName}: ${contentText.slice(0, 80)}`);
+  } finally {
+    // Always recall thinking emoji, even if processing fails
+    recallThinkingEmoji(robotCode, msgId, conversationId);
+  }
 }
 
 // --- Session webhook store ---

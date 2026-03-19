@@ -6,6 +6,14 @@ import { getAccessToken, apiRequestV1, apiRequestV2 } from './client.js';
 import { getCredentials, DATA_DIR } from './config.js';
 
 const MEDIA_DIR = path.join(DATA_DIR, 'media');
+const MAX_FILE_CONTENT_LENGTH = 50000; // 50K chars max for extracted text
+
+const TEXT_FILE_EXTENSIONS = new Set([
+  '.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.html', '.htm',
+  '.log', '.conf', '.ini', '.sh', '.py', '.js', '.ts', '.css', '.sql',
+]);
+
+const EXTRACTABLE_EXTENSIONS = new Set(['.docx', '.pdf']);
 
 /**
  * Reply via sessionWebhook (works for ~10 min after receiving message).
@@ -179,4 +187,141 @@ export async function downloadMedia(url, filename) {
     writer.on('finish', () => resolve(destPath));
     writer.on('error', reject);
   });
+}
+
+// --- Thinking Emoji ---
+
+/**
+ * Add "🤔思考中" emoji reaction to a message.
+ * Silently fails — never throws.
+ */
+export async function addThinkingEmoji(robotCode, msgId, conversationId) {
+  try {
+    await apiRequestV2('POST', '/v1.0/robot/emotion/reply', {
+      robotCode,
+      openMsgId: msgId,
+      openConversationId: conversationId,
+      emotionType: 2,
+      emotionName: '🤔思考中',
+      textEmotion: {
+        emotionId: '2659900',
+        emotionName: '🤔思考中',
+        text: '🤔思考中',
+        backgroundId: 'im_bg_1',
+      },
+    }, { timeout: 5000 });
+  } catch (err) {
+    console.warn(`[dingtalk] Add thinking emoji failed (non-blocking): ${err.message}`);
+  }
+}
+
+/**
+ * Recall "🤔思考中" emoji reaction from a message.
+ * Silently fails — never throws.
+ */
+export async function recallThinkingEmoji(robotCode, msgId, conversationId) {
+  try {
+    await apiRequestV2('POST', '/v1.0/robot/emotion/recall', {
+      robotCode,
+      openMsgId: msgId,
+      openConversationId: conversationId,
+      emotionType: 2,
+      emotionName: '🤔思考中',
+      textEmotion: {
+        emotionId: '2659900',
+        emotionName: '🤔思考中',
+        text: '🤔思考中',
+        backgroundId: 'im_bg_1',
+      },
+    }, { timeout: 5000 });
+  } catch (err) {
+    console.warn(`[dingtalk] Recall thinking emoji failed (non-blocking): ${err.message}`);
+  }
+}
+
+// --- File Content Extraction ---
+
+/**
+ * Download a file from DingTalk using downloadCode.
+ * Two-step: exchange downloadCode for URL, then download the file.
+ */
+export async function downloadFileByCode(downloadCode, fileName) {
+  const creds = getCredentials();
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+  // Step 1: Exchange downloadCode for download URL
+  const result = await apiRequestV2('POST', '/v1.0/robot/messageFiles/download', {
+    downloadCode,
+    robotCode: creds.robot_code,
+  }, { timeout: 15000 });
+
+  const downloadUrl = result?.downloadUrl;
+  if (!downloadUrl) {
+    throw new Error('No downloadUrl in response');
+  }
+
+  // Step 2: Download the file
+  const safeName = `${Date.now()}-${(fileName || 'file').replace(/[/\\:*?"<>|]/g, '_')}`;
+  const localPath = path.join(MEDIA_DIR, safeName);
+
+  const res = await axios({
+    method: 'GET',
+    url: downloadUrl,
+    responseType: 'arraybuffer',
+    timeout: 60000,
+  });
+
+  fs.writeFileSync(localPath, res.data);
+  console.log(`[dingtalk] File downloaded: ${localPath} (${res.data.length} bytes)`);
+  return localPath;
+}
+
+/**
+ * Extract text content from a downloaded file.
+ * Supports: text files, .docx (mammoth), .pdf (pdf-parse).
+ * Returns extracted text or null if not extractable.
+ */
+export async function extractFileContent(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const fileName = path.basename(filePath);
+
+  try {
+    // Text files — direct read
+    if (TEXT_FILE_EXTENSIONS.has(ext)) {
+      const content = fs.readFileSync(filePath, 'utf8');
+      return truncateContent(content, fileName);
+    }
+
+    // Word documents — mammoth
+    if (ext === '.docx') {
+      const mammoth = await import('mammoth');
+      const result = await mammoth.default.extractRawText({ path: filePath });
+      return truncateContent(result.value, fileName);
+    }
+
+    // PDF — pdf-parse
+    if (ext === '.pdf') {
+      const pdfParse = (await import('pdf-parse')).default;
+      const dataBuffer = fs.readFileSync(filePath);
+      const pdfData = await pdfParse(dataBuffer);
+      return truncateContent(pdfData.text, fileName);
+    }
+
+    // Not extractable
+    return null;
+  } catch (err) {
+    console.error(`[dingtalk] Failed to extract content from ${fileName}: ${err.message}`);
+    return null;
+  }
+}
+
+function truncateContent(text, fileName) {
+  if (!text) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.length > MAX_FILE_CONTENT_LENGTH) {
+    return `[文件: ${fileName}]\n\`\`\`\n${trimmed.slice(0, MAX_FILE_CONTENT_LENGTH)}\n...(内容过长，已截断)\n\`\`\``;
+  }
+  return `[文件: ${fileName}]\n\`\`\`\n${trimmed}\n\`\`\``;
 }
