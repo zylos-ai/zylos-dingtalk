@@ -8,6 +8,13 @@ import { execFile } from 'child_process';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { getUserInfo } from './lib/contact.js';
+import {
+  addThinkingEmoji,
+  recallThinkingEmoji,
+  downloadFileByCode,
+  extractFileContent,
+  cleanupMediaCache,
+} from './lib/message.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -19,6 +26,7 @@ const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 let config = getConfig();
 let streamClient = null;
 let internalServer = null;
+let mediaCleanupInterval = null;
 
 // Deduplication: msgId -> timestamp
 const processedMessages = new Map();
@@ -197,9 +205,14 @@ async function handleBotMessage(res) {
   try {
     msg = JSON.parse(res.data);
   } catch (err) {
-    console.error('[dingtalk] Failed to parse message data:', err.message);
-    // ACK to prevent retry
-    streamClient.socketCallBackResponse(res.headers.messageId, { status: 'FAIL' });
+    const payloadMeta = typeof res.data === 'string'
+      ? `type=string, len=${res.data.length}`
+      : `type=${typeof res.data}`;
+    console.error(`[dingtalk] Failed to parse message data: ${err.message}. Acking OK to avoid redelivery. (${payloadMeta})`);
+    // Malformed payloads are non-recoverable for this worker; ACK OK to avoid retry storms.
+    try {
+      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
+    } catch {}
     return;
   }
 
@@ -223,12 +236,14 @@ async function handleBotMessage(res) {
     return;
   }
 
-  // Resolve user name (prefer senderNick, fallback to API)
-  const userName = senderNick || await resolveUserName(senderStaffId);
-
   // conversationType: "1" = 1:1 DM, "2" = group
   const isGroup = conversationType === '2';
   const isDM = !isGroup;
+  let userName = senderNick || String(senderStaffId || 'Unknown');
+
+  // ACK as early as possible to avoid DingTalk 60s redelivery.
+  // Any downstream failure is handled internally and should not trigger resend storms.
+  streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
 
   // Permission check
   if (isDM) {
@@ -238,92 +253,144 @@ async function handleBotMessage(res) {
     }
     if (!checkDMPermission(senderStaffId)) {
       console.log(`[dingtalk] DM denied: ${userName} (${senderStaffId})`);
-      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
       return;
     }
   } else {
     if (!checkGroupPermission(senderStaffId, conversationId)) {
       console.log(`[dingtalk] Group denied: ${userName} in ${conversationTitle}`);
-      streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
       return;
     }
   }
 
-  // Extract content based on msgtype
-  let contentText = '';
-  let mediaPath = null;
+  // Add thinking emoji before handling body content.
+  // The helper swallows errors, so await here only ensures ordering.
+  const robotCode = creds.robot_code || creds.app_key;
+  const emojiStartTime = Date.now();
+  await addThinkingEmoji(robotCode, msgId, conversationId);
 
-  switch (msgtype) {
-    case 'text':
-      contentText = text?.content?.trim() || '';
-      break;
-    case 'richText':
-      contentText = '[rich text message]';
-      break;
-    case 'picture':
-      contentText = '[image]';
-      // TODO: download image if URL available in msg
-      break;
-    case 'video':
-      contentText = '[video]';
-      break;
-    case 'audio':
-      contentText = '[audio]';
-      break;
-    case 'file':
-      contentText = '[file]';
-      break;
-    default:
-      contentText = `[${msgtype || 'unknown'}]`;
-  }
-
-  if (!contentText) {
-    streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
-    return;
-  }
-
-  // Record to history
-  recordHistory(conversationId, {
-    msgId,
-    userId: senderStaffId,
-    userName,
-    text: contentText,
-    timestamp: new Date().toISOString(),
-  });
-
-  // Build C4 message
-  const replyEndpoint = isGroup
-    ? `${conversationId}|type:group|msg:${msgId}`
-    : `${senderStaffId}|type:p2p|msg:${msgId}`;
-
-  // Store sessionWebhook in a temp map so send.js can use it
-  storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
-
-  let c4Content = '';
-
-  if (isDM) {
-    c4Content = `[DingTalk DM] ${userName} said: ${contentText}`;
-  } else {
-    const context = getContextMessages(conversationId, msgId);
-    let contextStr = '';
-    if (context.length > 0) {
-      contextStr = '\n\n--- recent context ---\n' +
-        context.map(m => `${m.userName}: ${m.text}`).join('\n');
+  try {
+    // Resolve user name (prefer senderNick, fallback to API) after ACK
+    if (!senderNick && senderStaffId) {
+      userName = await resolveUserName(senderStaffId);
     }
-    c4Content = `[DingTalk GROUP:${conversationTitle || conversationId}] ${userName} said: ${contentText}${contextStr}`;
+
+    // Extract content based on msgtype
+    let contentText = '';
+    let fileContent = null;
+    let mediaPath = null;
+
+    switch (msgtype) {
+      case 'text':
+        contentText = text?.content?.trim() || '';
+        break;
+      case 'richText':
+        contentText = '[rich text message]';
+        break;
+      case 'picture':
+        contentText = '[image]';
+        // TODO: download image if URL available in msg
+        break;
+      case 'video':
+        contentText = '[video]';
+        break;
+      case 'audio':
+        contentText = '[audio]';
+        break;
+      case 'file': {
+        // Download and extract file content
+        let fileInfo = {};
+        if (msg.content && typeof msg.content === 'object') {
+          fileInfo = msg.content;
+        } else if (typeof msg.content === 'string') {
+          try {
+            fileInfo = JSON.parse(msg.content);
+          } catch {
+            // Keep best-effort behavior: top-level fields may still be present.
+          }
+        }
+
+        const fileNameRaw = msg.fileName ?? fileInfo.fileName ?? fileInfo.file_name ?? 'file';
+        const fileName = path.basename(String(fileNameRaw));
+        const downloadCode = msg.downloadCode ?? fileInfo.downloadCode ?? fileInfo.download_code;
+        contentText = `[文件: ${fileName}]`;
+
+        if (downloadCode) {
+          try {
+            const localPath = await downloadFileByCode(downloadCode, fileName);
+            mediaPath = localPath;
+            const extracted = await extractFileContent(localPath, fileName);
+            if (extracted) {
+              fileContent = extracted;
+            } else {
+              fileContent = `[文件已保存: ${fileName}，不支持内容提取]`;
+            }
+          } catch (err) {
+            console.error(`[dingtalk] File download/extract failed: ${err.message}`);
+            fileContent = `[文件下载失败: ${fileName}]`;
+          }
+        }
+        break;
+      }
+      default:
+        contentText = `[${msgtype || 'unknown'}]`;
+    }
+
+    if (!contentText) return;
+
+    // Record to history
+    recordHistory(conversationId, {
+      msgId,
+      userId: senderStaffId,
+      userName,
+      text: contentText,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Build C4 message
+    const replyEndpoint = isGroup
+      ? `${conversationId}|type:group|msg:${msgId}`
+      : `${senderStaffId}|type:p2p|msg:${msgId}`;
+
+    // Store sessionWebhook in a temp map so send.js can use it
+    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
+
+    let c4Content = '';
+
+    if (isDM) {
+      c4Content = `[DingTalk DM] ${userName} said: ${contentText}`;
+    } else {
+      const context = getContextMessages(conversationId, msgId);
+      let contextStr = '';
+      if (context.length > 0) {
+        contextStr = '\n\n--- recent context ---\n' +
+          context.map(m => `${m.userName}: ${m.text}`).join('\n');
+      }
+      c4Content = `[DingTalk GROUP:${conversationTitle || conversationId}] ${userName} said: ${contentText}${contextStr}`;
+    }
+
+    // Append extracted file content
+    if (fileContent) {
+      c4Content += `\n\n${fileContent}`;
+    }
+
+    if (mediaPath) {
+      c4Content += ` ---- file: ${mediaPath}`;
+    }
+
+    // Forward to C4
+    forwardToC4('dingtalk', replyEndpoint, c4Content);
+
+    console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName} (msgtype=${msgtype}, len=${contentText.length})`);
+  } finally {
+    // Ensure emoji is visible for at least 3 seconds to avoid jarring flash
+    const EMOJI_MIN_DISPLAY_MS = 3000;
+    const elapsed = Date.now() - emojiStartTime;
+    if (elapsed < EMOJI_MIN_DISPLAY_MS) {
+      await new Promise(r => setTimeout(r, EMOJI_MIN_DISPLAY_MS - elapsed));
+    }
+    // Always recall thinking emoji, even if processing fails
+    recallThinkingEmoji(robotCode, msgId, conversationId);
   }
-
-  if (mediaPath) {
-    c4Content += ` ---- file: ${mediaPath}`;
-  }
-
-  // Forward to C4
-  forwardToC4('dingtalk', replyEndpoint, c4Content);
-
-  // ACK
-  streamClient.socketCallBackResponse(res.headers.messageId, { status: 'OK' });
-
-  console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName}: ${contentText.slice(0, 80)}`);
 }
 
 // --- Session webhook store ---
@@ -444,14 +511,20 @@ async function main() {
   internalServer = startInternalServer(internalPort);
 
   // Create stream client
+  // IMPORTANT: autoReconnect MUST be false — the SDK's built-in reconnect
+  // calls connect() directly, bypassing our private IP detection, 503 retry,
+  // and null endpoint handling. We manage all reconnection ourselves.
   streamClient = new DWClient({
     clientId: creds.app_key,
     clientSecret: creds.app_secret,
+    autoReconnect: false,
+    keepAlive: false,
     debug: false,
   });
 
   // Register bot message handler
   streamClient.registerCallbackListener(TOPIC_ROBOT, async (res) => {
+    lastActivityTime = Date.now();
     try {
       await handleBotMessage(res);
     } catch (err) {
@@ -462,49 +535,321 @@ async function main() {
     }
   });
 
-  // Register generic event handler
+  // Register generic event handler (system messages, keepalive, etc.)
   streamClient.registerAllEventListener((msg) => {
+    lastActivityTime = Date.now();
     return { status: 'SUCCESS' };
   });
 
-  // Connect with private IP detection — retry if gateway returns a private IP
-  const MAX_ENDPOINT_RETRIES = 3;
+  // Connect with resilient retry logic
+  await connectWithRetry();
+
+  // Start the connection health watchdog
+  startWatchdog();
+
+  // Best-effort media cache cleanup to avoid disk growth from downloaded files.
+  cleanupMediaCache({ silent: true });
+  mediaCleanupInterval = setInterval(() => {
+    cleanupMediaCache({ silent: true });
+  }, 10 * 60 * 1000);
+}
+
+// --- Resilient connection ---
+const MAX_ENDPOINT_RETRIES = 5;
+const MAX_CONNECT_RETRIES = 10;
+const RECONNECT_BASE_DELAY = 3000;       // 3s base, exponential: 3s, 6s, 12s, 24s, 48s...
+const RECONNECT_MAX_DELAY = 5 * 60000;   // cap at 5 minutes
+const WATCHDOG_INTERVAL = 30000;          // check every 30s
+const WATCHDOG_TIMEOUT = 3 * 60000;      // 3 minutes no activity = stale
+let reconnecting = false;
+let lastActivityTime = Date.now();
+let watchdogTimer = null;
+let shuttingDown = false;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getReconnectDelay(attempt) {
+  return Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
+}
+
+function isNullEndpointError(err) {
+  const msg = String(err?.message || '');
+  return msg.includes('endpoint or ticket is null') ||
+    msg.includes('endpoint is null') ||
+    msg.includes('ticket is null');
+}
+
+function cleanupSocketForReconnect() {
   try {
-    for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+    const socket = streamClient?.socket;
+    if (!socket) return;
+    socket.removeAllListeners('close');
+    socket.removeAllListeners('error');
+    socket.removeAllListeners('pong');
+    socket.removeAllListeners('message');
+    streamClient.userDisconnect = true; // disable SDK auto reconnect on this close
+    socket.close();
+  } catch {}
+}
+
+/**
+ * Get the endpoint from DingTalk gateway, with retry for transient failures.
+ * Throws if a valid endpoint cannot be obtained after retries.
+ */
+async function getEndpointWithRetry() {
+  for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+    // Get endpoint
+    try {
       await streamClient.getEndpoint();
-      const host = extractHostFromURL(streamClient.dw_url);
-      if (host && isPrivateIP(host)) {
-        console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    } catch (err) {
+      const status = err.response?.status;
+      const code = err.response?.data?.code;
+      const isTransient = status === 503 || code === 'ServiceUnavailable' || isNullEndpointError(err)
+        || ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'ENOTFOUND'].includes(err.code);
+
+      if (isTransient && attempt < MAX_ENDPOINT_RETRIES - 1) {
+        const delay = getReconnectDelay(attempt);
+        console.warn(`[dingtalk] getEndpoint error (${err.code || status || code || err.message}), retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
+        await sleep(delay);
         continue;
       }
-      // _connect() is a private method of dingtalk-stream DWClient.
-      // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
-      await streamClient._connect();
-      console.log('[dingtalk] Stream connected');
+      throw err;
+    }
+
+    // Validate: null endpoint
+    if (!streamClient.dw_url) {
+      if (attempt < MAX_ENDPOINT_RETRIES - 1) {
+        const delay = getReconnectDelay(attempt);
+        console.warn(`[dingtalk] Gateway returned null endpoint, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      throw new Error('Gateway returned null endpoint after all retries');
+    }
+
+    // Validate: private IP
+    const host = extractHostFromURL(streamClient.dw_url);
+    if (host && isPrivateIP(host)) {
+      if (attempt < MAX_ENDPOINT_RETRIES - 1) {
+        console.warn(`[dingtalk] Gateway returned private IP ${host}, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES}`);
+        await sleep(1000 * (attempt + 1));
+        continue;
+      }
+      console.warn(`[dingtalk] All retries returned private IPs, proceeding with ${host} as last resort`);
+    }
+
+    return; // endpoint is valid
+  }
+
+  throw new Error('Failed to obtain DingTalk endpoint after retries');
+}
+
+/**
+ * Establish WebSocket connection and wait for it to actually open.
+ * SDK's _connect() resolves immediately (before socket opens), so we
+ * listen for the 'open' event ourselves.
+ */
+function connectSocket() {
+  return new Promise((resolve, reject) => {
+    // _connect() is a private method of dingtalk-stream DWClient.
+    // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
+    const connectPromise = streamClient._connect();
+
+    const socket = streamClient.socket;
+    if (!socket) {
+      reject(new Error('No socket created by _connect()'));
       return;
     }
-    // All retries got private IPs, try connecting anyway as last resort
-    console.warn('[dingtalk] All endpoint retries returned private IPs, attempting connection anyway');
-    // See version note above re: _connect()
-    await streamClient._connect();
-    console.log('[dingtalk] Stream connected (private IP fallback)');
-  } catch (err) {
-    console.error('[dingtalk] Stream connection failed:', err.message);
-    process.exit(1);
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('WebSocket open timeout (15s)'));
+    }, 15000);
+
+    function onOpen() {
+      cleanup();
+      resolve();
+    }
+    function onError(err) {
+      cleanup();
+      reject(err || new Error('WebSocket error during connect'));
+    }
+    function onClose(code) {
+      cleanup();
+      reject(new Error(`WebSocket closed during connect (code: ${code})`));
+    }
+    function cleanup() {
+      clearTimeout(timeout);
+      socket.removeListener('open', onOpen);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    }
+
+    socket.on('open', onOpen);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+
+    // _connect() may reject before 'open' if SDK fails early (e.g. bad ticket).
+    // Capture it so it participates in our retry path instead of unhandledRejection.
+    if (connectPromise && typeof connectPromise.catch === 'function') {
+      connectPromise.catch((err) => {
+        cleanup();
+        reject(err || new Error('WebSocket connect rejected'));
+      });
+    }
+  });
+}
+
+/**
+ * Attach persistent event listeners to the current WebSocket for
+ * disconnect detection. Called after each successful connection.
+ */
+function attachSocketListeners() {
+  const socket = streamClient.socket;
+  if (!socket) return;
+
+  socket.on('close', (code, reason) => {
+    const reasonStr = reason?.toString() || 'unknown';
+    console.warn(`[dingtalk] WebSocket closed (code: ${code}, reason: ${reasonStr})`);
+    streamClient.connected = false;
+    scheduleReconnect(`socket close (code: ${code})`);
+  });
+
+  socket.on('error', (err) => {
+    console.error(`[dingtalk] WebSocket error: ${err.message}`);
+    // Most errors are followed by 'close'; if not open anymore, force reconnect.
+    if (socket.readyState !== 1) {
+      scheduleReconnect(`socket error: ${err.message}`);
+    }
+  });
+
+  socket.on('pong', () => {
+    lastActivityTime = Date.now();
+  });
+
+  socket.on('message', () => {
+    lastActivityTime = Date.now();
+  });
+}
+
+/**
+ * Full connection flow: get endpoint → connect socket → attach listeners.
+ * Retries the entire flow up to MAX_CONNECT_RETRIES times.
+ */
+async function connectWithRetry(maxAttempts = MAX_CONNECT_RETRIES, reason = 'connect') {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (shuttingDown) throw new Error('Component is shutting down');
+
+    // Clean up any existing connection before each full attempt
+    cleanupSocketForReconnect();
+
+    try {
+      await getEndpointWithRetry();
+      await connectSocket();
+      lastActivityTime = Date.now();
+      attachSocketListeners();
+      console.log('[dingtalk] Stream connected and listeners attached');
+      return;
+    } catch (err) {
+      if (attempt < maxAttempts - 1) {
+        const delay = getReconnectDelay(attempt);
+        console.error(`[dingtalk] ${reason} failed: ${err.message}. Retry ${attempt + 1}/${maxAttempts} in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      throw new Error(`${reason} failed after ${maxAttempts} attempts (last: ${err.message})`);
+    }
   }
+}
+
+/**
+ * Schedule reconnection after connection loss.
+ * Idempotent — concurrent calls are deduplicated via `reconnecting` flag.
+ */
+async function scheduleReconnect(reason) {
+  if (shuttingDown || reconnecting) return;
+  reconnecting = true;
+  console.warn(`[dingtalk] Connection lost (${reason}), scheduling reconnect...`);
+
+  try {
+    await connectWithRetry(MAX_CONNECT_RETRIES, 'reconnect');
+    console.log('[dingtalk] Reconnected successfully');
+  } catch (err) {
+    console.error(`[dingtalk] Reconnect failed permanently: ${err.message}`);
+    if (!shuttingDown) process.exit(1);
+  } finally {
+    reconnecting = false;
+  }
+}
+
+/**
+ * Connection health watchdog.
+ * Checks every 30s whether we've received any data recently.
+ * If no activity for 3 minutes, the connection is likely stale — force reconnect.
+ * Also sends WebSocket ping to check for zombie connections.
+ */
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+
+  watchdogTimer = setInterval(() => {
+    if (reconnecting) return; // don't interfere with active reconnection
+
+    const elapsed = Date.now() - lastActivityTime;
+
+    if (!streamClient.socket) {
+      console.warn('[dingtalk] Watchdog: socket missing, forcing reconnect');
+      scheduleReconnect('watchdog socket missing');
+      return;
+    }
+
+    // Send WebSocket-level ping to keep connection alive and detect zombies
+    try {
+      if (streamClient.socket?.readyState === 1) { // OPEN
+        streamClient.socket.ping();
+      }
+    } catch {}
+
+    // Check for stale connection
+    if (elapsed > WATCHDOG_TIMEOUT) {
+      console.warn(`[dingtalk] Watchdog: no activity for ${Math.round(elapsed / 1000)}s, forcing reconnect`);
+      scheduleReconnect(`watchdog timeout (${Math.round(elapsed / 1000)}s idle)`);
+      return;
+    }
+
+    // Check socket state
+    const state = streamClient.socket?.readyState;
+    if (state !== undefined && state !== 1) { // not OPEN
+      const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+      console.warn(`[dingtalk] Watchdog: socket state is ${stateNames[state] || state}, forcing reconnect`);
+      scheduleReconnect(`socket state: ${stateNames[state] || state}`);
+    }
+  }, WATCHDOG_INTERVAL);
 }
 
 // --- Graceful shutdown ---
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('[dingtalk] Shutting down...');
   stopWatching();
   clearInterval(dedupCleanupInterval);
   clearInterval(userCachePersistInterval);
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  if (mediaCleanupInterval) clearInterval(mediaCleanupInterval);
+  cleanupMediaCache({ silent: true });
   persistUserCache();
 
   if (streamClient) {
-    try { streamClient.disconnect(); } catch {}
+    try {
+      // Remove reconnect-related listeners to avoid reconnect during shutdown
+      streamClient.socket?.removeAllListeners('close');
+      streamClient.socket?.removeAllListeners('error');
+      streamClient.socket?.removeAllListeners('pong');
+      streamClient.socket?.removeAllListeners('message');
+      streamClient.disconnect();
+    } catch {}
   }
   if (internalServer) {
     internalServer.close();
@@ -517,10 +862,32 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (err) => {
   console.error('[dingtalk] Uncaught exception:', err);
+  // Stream connection errors should trigger reconnect, not crash
+  if (!shuttingDown && isStreamConnectionError(err)) {
+    scheduleReconnect(`uncaughtException: ${err.message}`);
+  }
 });
 process.on('unhandledRejection', (err) => {
   console.error('[dingtalk] Unhandled rejection:', err);
+  // Stream connection errors should trigger reconnect, not crash
+  if (!shuttingDown && isStreamConnectionError(err)) {
+    scheduleReconnect(`unhandledRejection: ${err.message}`);
+  }
 });
+
+function isStreamConnectionError(err) {
+  if (!err) return false;
+  const msg = err.message || '';
+  // DingTalk gateway errors that indicate connection loss
+  if (msg.includes('endpoint or ticket is null')) return true;
+  if (msg.includes('gateway/connections/open')) return true;
+  // Network errors during stream
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' || err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND') return true;
+  // 503 fuse from DingTalk
+  const status = err.response?.status || err.status;
+  if (status === 503) return true;
+  return false;
+}
 
 main().catch(err => {
   console.error('[dingtalk] Fatal error:', err);

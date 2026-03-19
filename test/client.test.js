@@ -51,6 +51,30 @@ describe('isRetryable', () => {
     expect(isRetryable(err)).toBe(true);
   });
 
+  test('returns true for HTTP 503 (fuse/circuit breaker)', () => {
+    const err = new Error('fused');
+    err.response = { status: 503, data: { code: 'ServiceUnavailable' } };
+    expect(isRetryable(err)).toBe(true);
+  });
+
+  test('returns true for ServiceUnavailable code', () => {
+    const err = new Error('service unavailable');
+    err.response = { status: 200, data: { code: 'ServiceUnavailable' } };
+    expect(isRetryable(err)).toBe(true);
+  });
+
+  test('returns true for EAI_AGAIN', () => {
+    const err = new Error('dns');
+    err.code = 'EAI_AGAIN';
+    expect(isRetryable(err)).toBe(true);
+  });
+
+  test('returns true for ENOTFOUND', () => {
+    const err = new Error('dns not found');
+    err.code = 'ENOTFOUND';
+    expect(isRetryable(err)).toBe(true);
+  });
+
   test('returns false for auth error', () => {
     const err = new Error('auth failed');
     err.response = { status: 401 };
@@ -105,6 +129,18 @@ describe('withRetry', () => {
     await expect(withRetry(fn, 'test')).rejects.toThrow('429');
     expect(fn).toHaveBeenCalledTimes(4); // 1 initial + 3 retries
   }, 30000);
+
+  test('retries on 503 fuse and succeeds', async () => {
+    const err503 = new Error('fused');
+    err503.response = { status: 503, data: { code: 'ServiceUnavailable', message: 'The request has failed due to fused.' } };
+    const fn = jest.fn()
+      .mockRejectedValueOnce(err503)
+      .mockResolvedValue('recovered');
+
+    const result = await withRetry(fn, 'test');
+    expect(result).toBe('recovered');
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
 
   test('throws immediately on non-retryable error', async () => {
     const authErr = new Error('forbidden');

@@ -11,10 +11,13 @@ export const RETRY_BASE_DELAY = 1000; // 1s, 2s, 4s
  * Check if an error is retryable (throttle or transient network).
  */
 export function isRetryable(err) {
-  if (err.response?.status === 429) return true;
+  const status = err.response?.status;
+  if (status === 429) return true;
+  if (status === 503) return true; // DingTalk circuit breaker / fuse
   if (err.response?.data?.code === 'Throttling') return true;
+  if (err.response?.data?.code === 'ServiceUnavailable') return true;
   const code = err.code;
-  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
+  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN' || code === 'ENOTFOUND';
 }
 
 /**
