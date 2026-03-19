@@ -69,6 +69,12 @@ describe('isRetryable', () => {
     expect(isRetryable(err)).toBe(true);
   });
 
+  test('returns true for ENOTFOUND', () => {
+    const err = new Error('dns not found');
+    err.code = 'ENOTFOUND';
+    expect(isRetryable(err)).toBe(true);
+  });
+
   test('returns false for auth error', () => {
     const err = new Error('auth failed');
     err.response = { status: 401 };

@@ -17,7 +17,7 @@ export function isRetryable(err) {
   if (err.response?.data?.code === 'Throttling') return true;
   if (err.response?.data?.code === 'ServiceUnavailable') return true;
   const code = err.code;
-  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN';
+  return code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET' || code === 'EAI_AGAIN' || code === 'ENOTFOUND';
 }
 
 /**

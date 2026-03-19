@@ -491,10 +491,39 @@ const WATCHDOG_TIMEOUT = 3 * 60000;      // 3 minutes no activity = stale
 let reconnecting = false;
 let lastActivityTime = Date.now();
 let watchdogTimer = null;
+let shuttingDown = false;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getReconnectDelay(attempt) {
+  return Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
+}
+
+function isNullEndpointError(err) {
+  const msg = String(err?.message || '');
+  return msg.includes('endpoint or ticket is null') ||
+    msg.includes('endpoint is null') ||
+    msg.includes('ticket is null');
+}
+
+function cleanupSocketForReconnect() {
+  try {
+    const socket = streamClient?.socket;
+    if (!socket) return;
+    socket.removeAllListeners('close');
+    socket.removeAllListeners('error');
+    socket.removeAllListeners('pong');
+    socket.removeAllListeners('message');
+    streamClient.userDisconnect = true; // disable SDK auto reconnect on this close
+    socket.close();
+  } catch {}
+}
 
 /**
  * Get the endpoint from DingTalk gateway, with retry for transient failures.
- * Returns true if a valid endpoint was obtained, false if all retries failed.
+ * Throws if a valid endpoint cannot be obtained after retries.
  */
 async function getEndpointWithRetry() {
   for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
@@ -504,13 +533,13 @@ async function getEndpointWithRetry() {
     } catch (err) {
       const status = err.response?.status;
       const code = err.response?.data?.code;
-      const isTransient = status === 503 || code === 'ServiceUnavailable'
-        || ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code);
+      const isTransient = status === 503 || code === 'ServiceUnavailable' || isNullEndpointError(err)
+        || ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'ENOTFOUND'].includes(err.code);
 
       if (isTransient && attempt < MAX_ENDPOINT_RETRIES - 1) {
-        const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
-        console.warn(`[dingtalk] getEndpoint error (${err.code || status || code}), retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
+        const delay = getReconnectDelay(attempt);
+        console.warn(`[dingtalk] getEndpoint error (${err.code || status || code || err.message}), retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
+        await sleep(delay);
         continue;
       }
       throw err;
@@ -519,9 +548,9 @@ async function getEndpointWithRetry() {
     // Validate: null endpoint
     if (!streamClient.dw_url) {
       if (attempt < MAX_ENDPOINT_RETRIES - 1) {
-        const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, attempt), RECONNECT_MAX_DELAY);
+        const delay = getReconnectDelay(attempt);
         console.warn(`[dingtalk] Gateway returned null endpoint, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES} in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
+        await sleep(delay);
         continue;
       }
       throw new Error('Gateway returned null endpoint after all retries');
@@ -532,7 +561,7 @@ async function getEndpointWithRetry() {
     if (host && isPrivateIP(host)) {
       if (attempt < MAX_ENDPOINT_RETRIES - 1) {
         console.warn(`[dingtalk] Gateway returned private IP ${host}, retry ${attempt + 1}/${MAX_ENDPOINT_RETRIES}`);
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        await sleep(1000 * (attempt + 1));
         continue;
       }
       console.warn(`[dingtalk] All retries returned private IPs, proceeding with ${host} as last resort`);
@@ -540,6 +569,8 @@ async function getEndpointWithRetry() {
 
     return; // endpoint is valid
   }
+
+  throw new Error('Failed to obtain DingTalk endpoint after retries');
 }
 
 /**
@@ -551,7 +582,7 @@ function connectSocket() {
   return new Promise((resolve, reject) => {
     // _connect() is a private method of dingtalk-stream DWClient.
     // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
-    streamClient._connect();
+    const connectPromise = streamClient._connect();
 
     const socket = streamClient.socket;
     if (!socket) {
@@ -586,6 +617,15 @@ function connectSocket() {
     socket.on('open', onOpen);
     socket.on('error', onError);
     socket.on('close', onClose);
+
+    // _connect() may reject before 'open' if SDK fails early (e.g. bad ticket).
+    // Capture it so it participates in our retry path instead of unhandledRejection.
+    if (connectPromise && typeof connectPromise.catch === 'function') {
+      connectPromise.catch((err) => {
+        cleanup();
+        reject(err || new Error('WebSocket connect rejected'));
+      });
+    }
   });
 }
 
@@ -606,7 +646,10 @@ function attachSocketListeners() {
 
   socket.on('error', (err) => {
     console.error(`[dingtalk] WebSocket error: ${err.message}`);
-    // Don't reconnect here — 'close' always fires after 'error'
+    // Most errors are followed by 'close'; if not open anymore, force reconnect.
+    if (socket.readyState !== 1) {
+      scheduleReconnect(`socket error: ${err.message}`);
+    }
   });
 
   socket.on('pong', () => {
@@ -622,32 +665,29 @@ function attachSocketListeners() {
  * Full connection flow: get endpoint → connect socket → attach listeners.
  * Retries the entire flow up to MAX_CONNECT_RETRIES times.
  */
-async function connectWithRetry(retryCount = 0) {
-  // Clean up any existing connection first
-  try {
-    if (streamClient.socket) {
-      streamClient.socket.removeAllListeners('close');
-      streamClient.socket.removeAllListeners('error');
-      streamClient.userDisconnect = true; // prevent SDK auto-reconnect if still enabled
-      streamClient.socket.close();
-    }
-  } catch {}
+async function connectWithRetry(maxAttempts = MAX_CONNECT_RETRIES, reason = 'connect') {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (shuttingDown) throw new Error('Component is shutting down');
 
-  try {
-    await getEndpointWithRetry();
-    await connectSocket();
-    lastActivityTime = Date.now();
-    attachSocketListeners();
-    console.log('[dingtalk] Stream connected and listeners attached');
-    return;
-  } catch (err) {
-    if (retryCount < MAX_CONNECT_RETRIES - 1) {
-      const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, retryCount), RECONNECT_MAX_DELAY);
-      console.error(`[dingtalk] Connection failed: ${err.message}. Full retry ${retryCount + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
-      await new Promise(r => setTimeout(r, delay));
-      return connectWithRetry(retryCount + 1);
+    // Clean up any existing connection before each full attempt
+    cleanupSocketForReconnect();
+
+    try {
+      await getEndpointWithRetry();
+      await connectSocket();
+      lastActivityTime = Date.now();
+      attachSocketListeners();
+      console.log('[dingtalk] Stream connected and listeners attached');
+      return;
+    } catch (err) {
+      if (attempt < maxAttempts - 1) {
+        const delay = getReconnectDelay(attempt);
+        console.error(`[dingtalk] ${reason} failed: ${err.message}. Retry ${attempt + 1}/${maxAttempts} in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      throw new Error(`${reason} failed after ${maxAttempts} attempts (last: ${err.message})`);
     }
-    throw new Error(`All connection retries exhausted (last: ${err.message})`);
   }
 }
 
@@ -656,28 +696,19 @@ async function connectWithRetry(retryCount = 0) {
  * Idempotent — concurrent calls are deduplicated via `reconnecting` flag.
  */
 async function scheduleReconnect(reason) {
-  if (reconnecting) return;
+  if (shuttingDown || reconnecting) return;
   reconnecting = true;
   console.warn(`[dingtalk] Connection lost (${reason}), scheduling reconnect...`);
 
-  for (let i = 0; i < MAX_CONNECT_RETRIES; i++) {
-    const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(2, i), RECONNECT_MAX_DELAY);
-    console.log(`[dingtalk] Reconnect attempt ${i + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
-    await new Promise(r => setTimeout(r, delay));
-
-    try {
-      await connectWithRetry();
-      reconnecting = false;
-      console.log('[dingtalk] Reconnected successfully');
-      return;
-    } catch (err) {
-      console.error(`[dingtalk] Reconnect attempt ${i + 1} failed: ${err.message}`);
-    }
+  try {
+    await connectWithRetry(MAX_CONNECT_RETRIES, 'reconnect');
+    console.log('[dingtalk] Reconnected successfully');
+  } catch (err) {
+    console.error(`[dingtalk] Reconnect failed permanently: ${err.message}`);
+    if (!shuttingDown) process.exit(1);
+  } finally {
+    reconnecting = false;
   }
-
-  console.error('[dingtalk] All reconnect attempts failed, exiting for PM2 restart');
-  reconnecting = false;
-  process.exit(1);
 }
 
 /**
@@ -693,6 +724,12 @@ function startWatchdog() {
     if (reconnecting) return; // don't interfere with active reconnection
 
     const elapsed = Date.now() - lastActivityTime;
+
+    if (!streamClient.socket) {
+      console.warn('[dingtalk] Watchdog: socket missing, forcing reconnect');
+      scheduleReconnect('watchdog socket missing');
+      return;
+    }
 
     // Send WebSocket-level ping to keep connection alive and detect zombies
     try {
@@ -720,6 +757,8 @@ function startWatchdog() {
 
 // --- Graceful shutdown ---
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('[dingtalk] Shutting down...');
   stopWatching();
   clearInterval(dedupCleanupInterval);
@@ -729,8 +768,11 @@ async function shutdown() {
 
   if (streamClient) {
     try {
-      // Remove close listeners to prevent reconnect during shutdown
+      // Remove reconnect-related listeners to avoid reconnect during shutdown
       streamClient.socket?.removeAllListeners('close');
+      streamClient.socket?.removeAllListeners('error');
+      streamClient.socket?.removeAllListeners('pong');
+      streamClient.socket?.removeAllListeners('message');
       streamClient.disconnect();
     } catch {}
   }
@@ -746,14 +788,14 @@ process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (err) => {
   console.error('[dingtalk] Uncaught exception:', err);
   // Stream connection errors should trigger reconnect, not crash
-  if (isStreamConnectionError(err)) {
+  if (!shuttingDown && isStreamConnectionError(err)) {
     scheduleReconnect(`uncaughtException: ${err.message}`);
   }
 });
 process.on('unhandledRejection', (err) => {
   console.error('[dingtalk] Unhandled rejection:', err);
   // Stream connection errors should trigger reconnect, not crash
-  if (isStreamConnectionError(err)) {
+  if (!shuttingDown && isStreamConnectionError(err)) {
     scheduleReconnect(`unhandledRejection: ${err.message}`);
   }
 });
@@ -765,7 +807,7 @@ function isStreamConnectionError(err) {
   if (msg.includes('endpoint or ticket is null')) return true;
   if (msg.includes('gateway/connections/open')) return true;
   // Network errors during stream
-  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED') return true;
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' || err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND') return true;
   // 503 fuse from DingTalk
   const status = err.response?.status || err.status;
   if (status === 503) return true;
