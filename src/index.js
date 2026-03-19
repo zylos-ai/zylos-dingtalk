@@ -265,6 +265,7 @@ async function handleBotMessage(res) {
   // Add thinking emoji before handling body content.
   // The helper swallows errors, so await here only ensures ordering.
   const robotCode = creds.robot_code || creds.app_key;
+  const emojiStartTime = Date.now();
   await addThinkingEmoji(robotCode, msgId, conversationId);
 
   try {
@@ -381,6 +382,12 @@ async function handleBotMessage(res) {
 
     console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName} (msgtype=${msgtype}, len=${contentText.length})`);
   } finally {
+    // Ensure emoji is visible for at least 3 seconds to avoid jarring flash
+    const EMOJI_MIN_DISPLAY_MS = 3000;
+    const elapsed = Date.now() - emojiStartTime;
+    if (elapsed < EMOJI_MIN_DISPLAY_MS) {
+      await new Promise(r => setTimeout(r, EMOJI_MIN_DISPLAY_MS - elapsed));
+    }
     // Always recall thinking emoji, even if processing fails
     recallThinkingEmoji(robotCode, msgId, conversationId);
   }
