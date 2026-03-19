@@ -467,32 +467,108 @@ async function main() {
     return { status: 'SUCCESS' };
   });
 
-  // Connect with private IP detection — retry if gateway returns a private IP
-  const MAX_ENDPOINT_RETRIES = 3;
-  try {
-    for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+  // Connect with resilient retry logic
+  await connectWithRetry();
+}
+
+// --- Resilient connection ---
+const MAX_ENDPOINT_RETRIES = 3;
+const MAX_CONNECT_RETRIES = 5;
+const RECONNECT_BASE_DELAY = 3000; // 3s, 6s, 12s, 24s, 48s
+let reconnecting = false;
+
+async function connectWithRetry(retryCount = 0) {
+  for (let attempt = 0; attempt < MAX_ENDPOINT_RETRIES; attempt++) {
+    try {
       await streamClient.getEndpoint();
-      const host = extractHostFromURL(streamClient.dw_url);
-      if (host && isPrivateIP(host)) {
-        console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
-        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+    } catch (err) {
+      const status = err.response?.status;
+      const code = err.response?.data?.code;
+      // Handle 503 fuse / ServiceUnavailable
+      if (status === 503 || code === 'ServiceUnavailable') {
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        console.warn(`[dingtalk] Gateway 503 (fused), retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      // _connect() is a private method of dingtalk-stream DWClient.
-      // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
+      // Handle transient network errors
+      if (['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code)) {
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        console.warn(`[dingtalk] Gateway network error (${err.code}), retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+
+    // Check for null endpoint/ticket
+    if (!streamClient.dw_url) {
+      const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+      console.warn(`[dingtalk] Gateway returned null endpoint, retrying in ${delay}ms (${attempt + 1}/${MAX_ENDPOINT_RETRIES})`);
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+
+    // Check for private IP
+    const host = extractHostFromURL(streamClient.dw_url);
+    if (host && isPrivateIP(host)) {
+      console.warn(`[dingtalk] Gateway returned private IP ${host}, retrying (${attempt + 1}/${MAX_ENDPOINT_RETRIES})...`);
+      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      continue;
+    }
+
+    // _connect() is a private method of dingtalk-stream DWClient.
+    // Tested with dingtalk-stream@2.1.4. If the SDK updates, verify this still works.
+    try {
       await streamClient._connect();
       console.log('[dingtalk] Stream connected');
       return;
+    } catch (connectErr) {
+      console.error(`[dingtalk] _connect() failed: ${connectErr.message}`);
+      if (attempt < MAX_ENDPOINT_RETRIES - 1) {
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        console.warn(`[dingtalk] Retrying connection in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw connectErr;
     }
-    // All retries got private IPs, try connecting anyway as last resort
-    console.warn('[dingtalk] All endpoint retries returned private IPs, attempting connection anyway');
-    // See version note above re: _connect()
-    await streamClient._connect();
-    console.log('[dingtalk] Stream connected (private IP fallback)');
-  } catch (err) {
-    console.error('[dingtalk] Stream connection failed:', err.message);
-    process.exit(1);
   }
+
+  // All endpoint retries exhausted
+  if (retryCount < MAX_CONNECT_RETRIES) {
+    const delay = RECONNECT_BASE_DELAY * Math.pow(2, retryCount);
+    console.warn(`[dingtalk] All endpoint retries failed, full retry ${retryCount + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
+    await new Promise(r => setTimeout(r, delay));
+    return connectWithRetry(retryCount + 1);
+  }
+
+  throw new Error('All connection retries exhausted');
+}
+
+async function scheduleReconnect(reason) {
+  if (reconnecting) return;
+  reconnecting = true;
+  console.warn(`[dingtalk] Connection lost (${reason}), scheduling reconnect...`);
+
+  for (let i = 0; i < MAX_CONNECT_RETRIES; i++) {
+    const delay = RECONNECT_BASE_DELAY * Math.pow(2, i);
+    console.log(`[dingtalk] Reconnect attempt ${i + 1}/${MAX_CONNECT_RETRIES} in ${delay}ms`);
+    await new Promise(r => setTimeout(r, delay));
+
+    try {
+      await connectWithRetry();
+      reconnecting = false;
+      console.log('[dingtalk] Reconnected successfully');
+      return;
+    } catch (err) {
+      console.error(`[dingtalk] Reconnect attempt ${i + 1} failed: ${err.message}`);
+    }
+  }
+
+  console.error('[dingtalk] All reconnect attempts failed, exiting for PM2 restart');
+  reconnecting = false;
+  process.exit(1);
 }
 
 // --- Graceful shutdown ---
@@ -517,10 +593,32 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (err) => {
   console.error('[dingtalk] Uncaught exception:', err);
+  // Stream connection errors should trigger reconnect, not crash
+  if (isStreamConnectionError(err)) {
+    scheduleReconnect(`uncaughtException: ${err.message}`);
+  }
 });
 process.on('unhandledRejection', (err) => {
   console.error('[dingtalk] Unhandled rejection:', err);
+  // Stream connection errors should trigger reconnect, not crash
+  if (isStreamConnectionError(err)) {
+    scheduleReconnect(`unhandledRejection: ${err.message}`);
+  }
 });
+
+function isStreamConnectionError(err) {
+  if (!err) return false;
+  const msg = err.message || '';
+  // DingTalk gateway errors that indicate connection loss
+  if (msg.includes('endpoint or ticket is null')) return true;
+  if (msg.includes('gateway/connections/open')) return true;
+  // Network errors during stream
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED') return true;
+  // 503 fuse from DingTalk
+  const status = err.response?.status || err.status;
+  if (status === 503) return true;
+  return false;
+}
 
 main().catch(err => {
   console.error('[dingtalk] Fatal error:', err);
