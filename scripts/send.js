@@ -24,7 +24,7 @@ import { withRetry, isRetryable, MAX_RETRIES } from '../src/lib/retry.js';
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
 const DATA_DIR = path.join(os.homedir(), 'zylos/components/dingtalk');
-const INTERNAL_PORT = 4460;
+const INTERNAL_PORT = parseInt(process.env.DINGTALK_INTERNAL_PORT, 10) || 4460;
 const MAX_TEXT_LENGTH = 2000;
 const QUEUE_FILE = path.join(DATA_DIR, '.send-queue.json');
 const QUEUE_MAX = 10;
