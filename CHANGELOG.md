@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-05-27
+
+### Changed
+- Internal API port now configurable via `DINGTALK_INTERNAL_PORT` environment variable (default: 4460)
+
 ## [0.1.2] - 2026-03-19
 
 ### Added
