@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-01
+
 ### Added
 - `config.media.retention_days` — configurable media cache retention period (default 30 days). Set to 0 to disable cleanup. Read live from config.json on each cleanup cycle (no service restart needed).
 - post-install hook now prints media-retention configuration guidance for fresh installs.
