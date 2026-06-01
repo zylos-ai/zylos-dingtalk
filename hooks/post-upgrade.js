@@ -53,12 +53,37 @@ if (fs.existsSync(CONFIG_PATH)) {
       config.message.useMarkdownCard = false;
       migrated = true;
     }
+    // media.retention_days: introduced for configurable media cache TTL.
+    // Previous versions used a hardcoded 24h cap + 500-file / 512MB caps;
+    // the new behavior is age-only, default 30 days.
+    let mediaRetentionAdded = false;
+    if (config.media === undefined) {
+      config.media = { retention_days: 30 };
+      migrated = true;
+      mediaRetentionAdded = true;
+    } else if (config.media.retention_days === undefined) {
+      config.media.retention_days = 30;
+      migrated = true;
+      mediaRetentionAdded = true;
+    }
 
     if (migrated) {
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
       console.log('[dingtalk post-upgrade] Config migrated with new fields');
     } else {
       console.log('[dingtalk post-upgrade] Config is up to date');
+    }
+
+    if (mediaRetentionAdded) {
+      console.log(`
+[dingtalk post-upgrade] Media cache cleanup behavior changed:
+  - Previous: removed files > 24h old, or > 500 files, or > 512MB total
+  - Now:      only removes files older than media.retention_days (default 30)
+
+  Edit ${CONFIG_PATH}
+  and set "media.retention_days" to your preferred value
+  (non-negative integer; 0 disables cleanup, files will accumulate).
+`);
     }
   } catch (err) {
     console.error('[dingtalk post-upgrade] Config migration failed:', err.message);

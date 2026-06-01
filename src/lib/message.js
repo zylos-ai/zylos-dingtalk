@@ -3,7 +3,7 @@ import path from 'path';
 import axios from 'axios';
 import FormData from 'form-data';
 import { getAccessToken, apiRequestV1, apiRequestV2 } from './client.js';
-import { getCredentials, DATA_DIR } from './config.js';
+import { getCredentials, getConfig, DATA_DIR } from './config.js';
 
 const MEDIA_DIR = path.join(DATA_DIR, 'media');
 const DINGTALK_API_V2 = 'https://api.dingtalk.com';
@@ -11,7 +11,14 @@ const MAX_FILE_CONTENT_LENGTH = 50000; // 50K chars max for extracted text
 const MAX_DOWNLOAD_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_TEXT_READ_SIZE = 2 * 1024 * 1024; // 2MB text direct-read limit
 const MAX_PARSE_FILE_SIZE = 20 * 1024 * 1024; // 20MB parse safety limit
-const MEDIA_FILE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30d
+const DEFAULT_RETENTION_DAYS = 30;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function resolveRetentionMs() {
+  const raw = getConfig()?.media?.retention_days;
+  const days = Number.isInteger(raw) && raw >= 0 ? raw : DEFAULT_RETENTION_DAYS;
+  return days * MS_PER_DAY;  // 0 → 0ms → cleanup disabled
+}
 
 const TEXT_FILE_EXTENSIONS = new Set([
   '.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.html', '.htm',
@@ -33,11 +40,16 @@ function formatBytes(bytes) {
 
 /**
  * Cleanup downloaded media files.
- * Removes files older than MEDIA_FILE_MAX_AGE_MS (30 days).
+ * Removes files older than config.media.retention_days (default 30 days).
+ * If retention_days is 0, cleanup is disabled and this function is a no-op
+ * apart from ensuring the media dir exists.
  */
 export function cleanupMediaCache({ silent = false } = {}) {
   try {
     fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+    const maxAgeMs = resolveRetentionMs();
+    if (maxAgeMs === 0) return;  // cleanup disabled via config
 
     const now = Date.now();
     const entries = fs.readdirSync(MEDIA_DIR, { withFileTypes: true })
@@ -56,7 +68,7 @@ export function cleanupMediaCache({ silent = false } = {}) {
     let remainingSize = 0;
     let remainingCount = 0;
     for (const file of entries) {
-      if (now - file.mtimeMs > MEDIA_FILE_MAX_AGE_MS) {
+      if (now - file.mtimeMs > maxAgeMs) {
         try {
           fs.unlinkSync(file.path);
           removedByAge += 1;

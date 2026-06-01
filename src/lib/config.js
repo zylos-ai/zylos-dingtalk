@@ -17,6 +17,13 @@ const DEFAULT_CONFIG = {
     context_messages: 10,
     useMarkdownCard: false,
   },
+  media: {
+    // Files in ~/zylos/components/dingtalk/media/ older than this are
+    // deleted by the 10-minute scheduled cleanup. Set to 0 to disable
+    // cleanup entirely (files will accumulate). Must be a non-negative
+    // integer; invalid values fall back to 30.
+    retention_days: 30,
+  },
 };
 
 let config = null;

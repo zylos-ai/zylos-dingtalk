@@ -18,6 +18,9 @@ const DEFAULT_CONFIG = {
     context_messages: 10,
     useMarkdownCard: false,
   },
+  media: {
+    retention_days: 30,
+  },
 };
 
 console.log('[dingtalk post-install] Setting up data directories...');
@@ -66,7 +69,14 @@ Next steps:
    - Set message receiving mode to "Stream"
    - Note your App Key, App Secret, and Robot Code
 
-3. Start the service:
+3. (Optional) Configure media cache retention:
+   Downloaded media files are cleaned up every 10 minutes. The default
+   retention is 30 days. To change it, edit:
+       ${configPath}
+   and set "media.retention_days" to any non-negative integer
+   (0 disables cleanup entirely; files will accumulate).
+
+4. Start the service:
    pm2 start ~/zylos/.claude/skills/dingtalk/ecosystem.config.cjs
    pm2 save
 `);

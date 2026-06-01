@@ -4,6 +4,7 @@ import { jest } from '@jest/globals';
 const mockCredentials = { app_key: 'k', app_secret: 's', robot_code: 'robot-123' };
 jest.unstable_mockModule('../src/lib/config.js', () => ({
   getCredentials: () => mockCredentials,
+  getConfig: () => ({ media: { retention_days: 30 } }),
   DATA_DIR: '/tmp/test-dingtalk',
 }));
 
