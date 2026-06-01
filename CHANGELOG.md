@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Media cache cleanup now only enforces file age (30 days). The 500-file count cap and 512MB total-size cap have been removed. The 10-minute scheduled check and download/startup/shutdown trigger points remain unchanged.
+
 ## [0.1.3] - 2026-05-27
 
 ### Changed

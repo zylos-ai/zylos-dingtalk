@@ -11,9 +11,7 @@ const MAX_FILE_CONTENT_LENGTH = 50000; // 50K chars max for extracted text
 const MAX_DOWNLOAD_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_TEXT_READ_SIZE = 2 * 1024 * 1024; // 2MB text direct-read limit
 const MAX_PARSE_FILE_SIZE = 20 * 1024 * 1024; // 20MB parse safety limit
-const MEDIA_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
-const MEDIA_FILE_MAX_COUNT = 500;
-const MEDIA_TOTAL_MAX_SIZE = 512 * 1024 * 1024; // 512MB
+const MEDIA_FILE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30d
 
 const TEXT_FILE_EXTENSIONS = new Set([
   '.txt', '.md', '.csv', '.json', '.xml', '.yaml', '.yml', '.html', '.htm',
@@ -35,7 +33,7 @@ function formatBytes(bytes) {
 
 /**
  * Cleanup downloaded media files.
- * Removes files older than max age and enforces count/size caps.
+ * Removes files older than MEDIA_FILE_MAX_AGE_MS (30 days).
  */
 export function cleanupMediaCache({ silent = false } = {}) {
   try {
@@ -48,16 +46,15 @@ export function cleanupMediaCache({ silent = false } = {}) {
         const fullPath = path.join(MEDIA_DIR, d.name);
         const stat = fs.statSync(fullPath);
         return {
-          name: d.name,
           path: fullPath,
           mtimeMs: stat.mtimeMs,
           size: stat.size,
         };
-      })
-      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+      });
 
-    const kept = [];
     let removedByAge = 0;
+    let remainingSize = 0;
+    let remainingCount = 0;
     for (const file of entries) {
       if (now - file.mtimeMs > MEDIA_FILE_MAX_AGE_MS) {
         try {
@@ -65,32 +62,13 @@ export function cleanupMediaCache({ silent = false } = {}) {
           removedByAge += 1;
         } catch {}
       } else {
-        kept.push(file);
+        remainingCount += 1;
+        remainingSize += file.size;
       }
     }
 
-    let removedByCount = 0;
-    while (kept.length > MEDIA_FILE_MAX_COUNT) {
-      const oldest = kept.shift();
-      try {
-        fs.unlinkSync(oldest.path);
-        removedByCount += 1;
-      } catch {}
-    }
-
-    let totalSize = kept.reduce((sum, f) => sum + f.size, 0);
-    let removedBySize = 0;
-    while (totalSize > MEDIA_TOTAL_MAX_SIZE && kept.length > 0) {
-      const oldest = kept.shift();
-      try {
-        fs.unlinkSync(oldest.path);
-      } catch {}
-      totalSize -= oldest.size;
-      removedBySize += 1;
-    }
-
-    if (!silent && (removedByAge || removedByCount || removedBySize)) {
-      console.log(`[dingtalk] Media cache cleanup: -age ${removedByAge}, -count ${removedByCount}, -size ${removedBySize}, remaining ${kept.length}, total ${formatBytes(Math.max(0, totalSize))}`);
+    if (!silent && removedByAge > 0) {
+      console.log(`[dingtalk] Media cache cleanup: -age ${removedByAge}, remaining ${remainingCount}, total ${formatBytes(remainingSize)}`);
     }
   } catch (err) {
     if (!silent) {
