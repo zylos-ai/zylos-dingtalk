@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.1.4] - 2026-06-01
+
+### Added
+- `config.media.retention_days` — configurable media cache retention period (default 30 days). Set to 0 to disable cleanup. Read live from config.json on each cleanup cycle (no service restart needed).
+- post-install hook now prints media-retention configuration guidance for fresh installs.
+- post-upgrade hook now migrates existing configs to add `media.retention_days: 30` and prints a one-time notice about the behavior change.
+
+### Changed
+- Media cache cleanup now only enforces file age. The 500-file count cap and 512MB total-size cap have been removed. The 10-minute scheduled check and download/startup/shutdown trigger points remain unchanged.
+
 ## [0.1.3] - 2026-05-27
 
 ### Changed

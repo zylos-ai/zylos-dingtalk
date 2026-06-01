@@ -1,6 +1,6 @@
 ---
 name: dingtalk
-version: 0.1.3
+version: 0.1.4
 description: >
   DingTalk (钉钉) communication channel. Receives messages via Stream mode
   (WebSocket) and sends messages via DingTalk REST API. Use when:

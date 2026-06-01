@@ -18,6 +18,7 @@ const TEST_MEDIA_DIR = path.join(os.tmpdir(), `dingtalk-test-media-${Date.now()}
 
 jest.unstable_mockModule('../src/lib/config.js', () => ({
   getCredentials: () => mockCredentials,
+  getConfig: () => ({ media: { retention_days: 30 } }),
   DATA_DIR: path.dirname(TEST_MEDIA_DIR),
 }));
 
