@@ -81,6 +81,24 @@ describe('sendDM', () => {
       sendDM('user-1', 'sampleText', { content: 'hello' }),
     ).rejects.toThrow('DM send failed');
   });
+
+  test('uses robot_code as robotCode when set', async () => {
+    mockAxios.mockResolvedValueOnce({ data: { processQueryKey: 'pqk' } });
+    await sendDM('user-1', 'sampleText', { content: 'hello' });
+    expect(mockAxios.mock.lastCall[0].data.robotCode).toBe('robot-123');
+  });
+
+  test('falls back to app_key when robot_code is empty', async () => {
+    const saved = mockCredentials.robot_code;
+    mockCredentials.robot_code = '';
+    try {
+      mockAxios.mockResolvedValueOnce({ data: { processQueryKey: 'pqk' } });
+      await sendDM('user-1', 'sampleText', { content: 'hello' });
+      expect(mockAxios.mock.lastCall[0].data.robotCode).toBe('k');
+    } finally {
+      mockCredentials.robot_code = saved;
+    }
+  });
 });
 
 // ─── sendGroup ────────────────────────────────────────────────────────────────

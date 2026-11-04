@@ -1,6 +1,6 @@
 ---
 name: dingtalk
-version: 0.1.4
+version: 0.2.0
 description: >
   DingTalk (钉钉) communication channel. Receives messages via Stream mode
   (WebSocket) and sends messages via DingTalk REST API. Use when:
@@ -82,3 +82,53 @@ node ~/zylos/.claude/skills/dingtalk/src/admin.js help
 ```bash
 node ~/zylos/.claude/skills/dingtalk/scripts/send.js <endpoint> "message"
 ```
+
+## Owner Requests: Enabling Groups and DMs
+
+After the first DM binds the owner, the bot sends the owner a one-time guide
+telling them which phrases to use. These are **owner-only** admin changes.
+Group messages carry only the sender's nickname (no staffId), so the owner
+cannot be reliably verified in an already-enabled group. Follow these rules
+exactly:
+
+**「开启本群」 (said in a group, @bot)**
+1. Run `admin.js list-groups` first.
+2. If the group (its conversationId) is **already listed**, do NOT run
+   `add-group` again — re-adding resets its `allowFrom` to empty (open to
+   everyone in the group). Make no change; reply that the group is already
+   enabled, and that any group-admin change must be requested by the owner in
+   a private chat.
+3. Check `groupPolicy` (shown by `list-groups`). If it is `open`, every
+   member's messages reach the Agent, so the sender cannot be verified as the
+   owner: refuse group-admin changes in the group and ask the owner to do it
+   in a private chat. Only when `groupPolicy` is `allowlist` or `disabled`
+   **and** the group is not listed is the group not enabled; there only the
+   owner's messages reach the Agent (owner bypass), so honor it: run
+   `admin.js add-group <conversationId> "<group name>"` — the conversationId is the first segment of the group reply endpoint
+   (`<conversationId>|type:group|msg:...`), the name comes from
+   `[DingTalk GROUP:<name>]`. If `groupPolicy` is `disabled`, also run
+   `admin.js set-group-policy allowlist`.
+4. In an already-enabled group, refuse every other group-admin change
+   (allowFrom, remove-group, policy) and ask the owner to do it in a private
+   chat.
+
+**DM-policy phrases — private chat with the owner only.** Honor them only in
+a DM whose sender staffId (first segment of the DM endpoint
+`<staff_id>|type:p2p|msg:...`) equals the owner's staff_id from
+`admin.js show-owner`. Refuse them in groups or from anyone else.
+- 「允许所有同事私聊你」 → `admin.js set-dm-policy open`
+- 「允许某某私聊你」 → get that person's staffId (first segment of their DM
+  endpoint, or ask the owner), then `admin.js add-dm-allow <staff_id>`; if
+  `dmPolicy` is `owner`, also run `admin.js set-dm-policy allowlist`.
+
+Config changes are hot-reloaded by the running service. Confirm the result to
+the owner in the same chat.
+
+## Blocked Group Messages
+
+When a group message is blocked by access control and the bot was @-mentioned,
+the bot replies once in the group (non-mentions are ignored silently):
+- group not enabled (policy `disabled`, or `allowlist` and the group is not configured):
+  「本群还没开通，请联系 Agent 管理者开启」
+- group enabled but the sender is not in its `allowFrom`:
+  「你在本群暂无权限使用我，请联系 Agent 管理者开通」
