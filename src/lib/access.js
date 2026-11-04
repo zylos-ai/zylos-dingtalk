@@ -37,9 +37,13 @@ export function getGroupDenyReason(config, staffId, conversationId) {
     case 'allowlist': {
       const groupConfig = config.groups?.[conversationId];
       if (!groupConfig) return DENY_GROUP_NOT_ENABLED;
-      if (!groupConfig.allowFrom || groupConfig.allowFrom.length === 0) return null;
-      if (groupConfig.allowFrom.includes('*')) return null;
-      return groupConfig.allowFrom.includes(String(staffId)) ? null : DENY_SENDER_NOT_ALLOWED;
+      const { allowFrom } = groupConfig;
+      // Missing allowFrom means everyone in the group may talk to the bot.
+      if (allowFrom === undefined || allowFrom === null) return null;
+      // Malformed (non-array) allowFrom fails closed instead of substring-matching.
+      if (!Array.isArray(allowFrom)) return DENY_SENDER_NOT_ALLOWED;
+      if (allowFrom.length === 0 || allowFrom.includes('*')) return null;
+      return allowFrom.some(id => String(id) === String(staffId)) ? null : DENY_SENDER_NOT_ALLOWED;
     }
     case 'disabled':
     default:
@@ -89,6 +93,19 @@ export async function notifyGroupDenied(msg, reason, reply) {
 }
 
 /**
+ * Group access gate used by the message handler.
+ * Returns { allowed, reason, notice }. When denied, the caller must stop
+ * processing the message. If the bot was @-mentioned, a one-time notice is
+ * sent fire-and-forget; `notice` is that promise (never rejects), or null.
+ */
+export function checkGroupAccess({ config, msg, reply }) {
+  const reason = getGroupDenyReason(config, msg.senderStaffId, msg.conversationId);
+  if (!reason) return { allowed: true, reason: null, notice: null };
+  const notice = isBotMentioned(msg) ? notifyGroupDenied(msg, reason, reply) : null;
+  return { allowed: false, reason, notice };
+}
+
+/**
  * Bind the first DM sender as owner if no owner is bound yet.
  * Returns true only when this call actually bound the owner and the config
  * was persisted successfully.
@@ -128,4 +145,16 @@ export async function sendOwnerGuide({ staffId, sessionWebhook, reply, sendDM })
     console.error(`[dingtalk] Failed to send owner guide: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Owner auto-binding on DM. If no owner is bound, binds the sender and, only
+ * when binding (and saving) succeeded, sends the owner guide fire-and-forget.
+ * Returns { bound, guide } where `guide` is the send promise (never rejects)
+ * or null. Message handling should continue regardless.
+ */
+export function bindOwnerWithGuide({ config, staffId, name, sessionWebhook, save, reply, sendDM }) {
+  const bound = bindOwner(config, staffId, name, save);
+  const guide = bound ? sendOwnerGuide({ staffId, sessionWebhook, reply, sendDM }) : null;
+  return { bound, guide };
 }

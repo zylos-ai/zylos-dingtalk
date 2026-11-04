@@ -19,10 +19,8 @@ import {
 } from './lib/message.js';
 import {
   isOwner as isOwnerInConfig,
-  getGroupDenyReason,
-  notifyGroupDenied,
-  bindOwner,
-  sendOwnerGuide,
+  checkGroupAccess,
+  bindOwnerWithGuide,
 } from './lib/access.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
@@ -166,10 +164,18 @@ function checkDMPermission(staffId) {
   }
 }
 
+// --- Reply helpers for access-control notices ---
+const replyWebhookText = (webhook, content) => replyText(webhook, content);
+const sendOwnerDM = (staffId, content) => sendTextDM([staffId], content);
+
 // --- Owner auto-binding ---
 // Returns true only when this call bound the owner and the config was saved.
-async function tryBindOwner(staffId, name) {
-  return bindOwner(config, staffId, name, saveConfig);
+// On bind, the owner guide is sent fire-and-forget (errors are logged).
+function tryBindOwner(staffId, name, sessionWebhook) {
+  return bindOwnerWithGuide({
+    config, staffId, name, sessionWebhook,
+    save: saveConfig, reply: replyWebhookText, sendDM: sendOwnerDM,
+  }).bound;
 }
 
 // --- C4 forwarding ---
@@ -240,27 +246,17 @@ async function handleBotMessage(res) {
   if (isDM) {
     // Auto-bind owner on first DM
     if (!config.owner?.bound) {
-      const bound = await tryBindOwner(senderStaffId, userName);
-      if (bound) {
-        // One-time guide for the new owner; errors are swallowed inside.
-        await sendOwnerGuide({
-          staffId: senderStaffId,
-          sessionWebhook,
-          reply: (webhook, content) => replyText(webhook, content),
-          sendDM: (staffId, content) => sendTextDM([staffId], content),
-        });
-      }
+      tryBindOwner(senderStaffId, userName, sessionWebhook);
     }
     if (!checkDMPermission(senderStaffId)) {
       console.log(`[dingtalk] DM denied: ${userName} (${senderStaffId})`);
       return;
     }
   } else {
-    const denyReason = getGroupDenyReason(config, senderStaffId, conversationId);
-    if (denyReason) {
-      console.log(`[dingtalk] Group denied (${denyReason}): ${userName} in ${conversationTitle}`);
-      // Only reply when the bot was @-mentioned; never to plain group chatter.
-      await notifyGroupDenied(msg, denyReason, (webhook, content) => replyText(webhook, content));
+    // Denied @-mentions get a one-time notice (fire-and-forget); others stay silent.
+    const access = checkGroupAccess({ config, msg, reply: replyWebhookText });
+    if (!access.allowed) {
+      console.log(`[dingtalk] Group denied (${access.reason}): ${userName} in ${conversationTitle}`);
       return;
     }
   }

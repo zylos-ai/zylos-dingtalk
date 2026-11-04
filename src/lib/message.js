@@ -136,7 +136,8 @@ export async function sendDM(userIds, msgKey, msgParam) {
   const creds = getCredentials();
   const ids = Array.isArray(userIds) ? userIds : [userIds];
   const res = await apiRequestV2('POST', '/v1.0/robot/oToMessages/batchSend', {
-    robotCode: creds.robot_code,
+    // Same fallback as the emoji/download paths: robotCode defaults to app_key.
+    robotCode: creds.robot_code || creds.app_key,
     userIds: ids,
     msgKey,
     msgParam: typeof msgParam === 'string' ? msgParam : JSON.stringify(msgParam),

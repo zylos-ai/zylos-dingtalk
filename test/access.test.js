@@ -1,5 +1,5 @@
 /**
- * Tests for group-denied notices and the owner guide (OPENM-1149).
+ * Tests for group access notices and the owner guide (src/lib/access.js).
  */
 
 import { jest } from '@jest/globals';
@@ -14,6 +14,8 @@ import {
   notifyGroupDenied,
   bindOwner,
   sendOwnerGuide,
+  checkGroupAccess,
+  bindOwnerWithGuide,
 } from '../src/lib/access.js';
 
 const OWNER = { bound: true, staff_id: 'owner1', name: 'Owner' };
@@ -82,6 +84,17 @@ describe('getGroupDenyReason', () => {
     expect(getGroupDenyReason({ groupPolicy: 'allowlist', groups: { cid1: { allowFrom: ['u2'] } } }, 'u1', 'cid1')).toBe(DENY_SENDER_NOT_ALLOWED);
   });
 
+  test('non-array allowFrom fails closed (no substring matching)', () => {
+    const cfg = { groupPolicy: 'allowlist', groups: { cid1: { allowFrom: 'u1,u2' } } };
+    expect(getGroupDenyReason(cfg, 'u1', 'cid1')).toBe(DENY_SENDER_NOT_ALLOWED);
+    expect(getGroupDenyReason({ groupPolicy: 'allowlist', groups: { cid1: { allowFrom: '' } } }, 'u1', 'cid1')).toBe(DENY_SENDER_NOT_ALLOWED);
+    expect(getGroupDenyReason({ groupPolicy: 'allowlist', groups: { cid1: { allowFrom: '*' } } }, 'u1', 'cid1')).toBe(DENY_SENDER_NOT_ALLOWED);
+  });
+
+  test('allowFrom ids are compared as strings', () => {
+    expect(getGroupDenyReason({ groupPolicy: 'allowlist', groups: { cid1: { allowFrom: [123] } } }, '123', 'cid1')).toBeNull();
+  });
+
   test('unknown policy -> group not enabled', () => {
     expect(getGroupDenyReason({ groupPolicy: 'weird' }, 'u1', 'cid1')).toBe(DENY_GROUP_NOT_ENABLED);
   });
@@ -145,57 +158,126 @@ describe('notifyGroupDenied', () => {
   });
 });
 
-describe('owner binding + guide', () => {
-  // Mirrors the DM flow in src/index.js: bind on first DM, guide only on bind.
-  async function onDM(config, save, reply, staffId, sessionWebhook = 'https://hook') {
-    if (!config.owner?.bound) {
-      if (bindOwner(config, staffId, 'Name', save)) {
-        await sendOwnerGuide({ staffId, sessionWebhook, reply, sendDM: jest.fn() });
-      }
-    }
+describe('checkGroupAccess', () => {
+  const notEnabled = { groupPolicy: 'allowlist', groups: {} };
+
+  test('blocked group mention -> caller stops, exactly one notice', async () => {
+    const reply = jest.fn().mockResolvedValue({});
+    const res = checkGroupAccess({ config: notEnabled, msg: groupMsg(), reply });
+    expect(res.allowed).toBe(false);
+    expect(res.reason).toBe(DENY_GROUP_NOT_ENABLED);
+    expect(await res.notice).toBe(true);
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply).toHaveBeenCalledWith(groupMsg().sessionWebhook, GROUP_NOT_ENABLED_NOTICE);
+  });
+
+  test('blocked mention by non-allowed sender -> no-permission notice', async () => {
+    const reply = jest.fn().mockResolvedValue({});
+    const config = { groupPolicy: 'allowlist', groups: { cid1: { allowFrom: ['u2'] } } };
+    const res = checkGroupAccess({ config, msg: groupMsg(), reply });
+    expect(res.allowed).toBe(false);
+    await res.notice;
+    expect(reply).toHaveBeenCalledWith(groupMsg().sessionWebhook, GROUP_NO_PERMISSION_NOTICE);
+  });
+
+  test('blocked non-mention -> caller stops, no notice', () => {
+    const reply = jest.fn();
+    const res = checkGroupAccess({ config: notEnabled, msg: groupMsg({ isInAtList: false }), reply });
+    expect(res.allowed).toBe(false);
+    expect(res.notice).toBeNull();
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  test('allowed mention -> caller continues, no notice', () => {
+    const reply = jest.fn();
+    const res = checkGroupAccess({ config: { groupPolicy: 'open' }, msg: groupMsg(), reply });
+    expect(res).toEqual({ allowed: true, reason: null, notice: null });
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  test('does not wait for the notice send (fire-and-forget)', () => {
+    const reply = jest.fn(() => new Promise(() => {})); // never settles
+    const res = checkGroupAccess({ config: notEnabled, msg: groupMsg(), reply });
+    expect(res.allowed).toBe(false);
+    expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  test('notice send failure is swallowed', async () => {
+    const reply = jest.fn().mockRejectedValue(new Error('boom'));
+    const res = checkGroupAccess({ config: notEnabled, msg: groupMsg(), reply });
+    await expect(res.notice).resolves.toBe(false);
+    expect(errSpy).toHaveBeenCalled();
+  });
+});
+
+describe('bindOwnerWithGuide', () => {
+  function deps(overrides = {}) {
+    return {
+      save: jest.fn().mockReturnValue(true),
+      reply: jest.fn().mockResolvedValue({}),
+      sendDM: jest.fn().mockResolvedValue({}),
+      ...overrides,
+    };
   }
 
-  test('first DM binds owner and sends the guide once; second DM sends nothing', async () => {
+  test('first DM binds owner and sends the guide once; later DMs send nothing', async () => {
     const config = { owner: { bound: false, staff_id: '', name: '' } };
-    const save = jest.fn().mockReturnValue(true);
-    const reply = jest.fn().mockResolvedValue({});
+    const d = deps();
 
-    await onDM(config, save, reply, 'owner1');
+    const first = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'Name', sessionWebhook: 'https://hook', ...d });
+    expect(first.bound).toBe(true);
+    expect(await first.guide).toBe(true);
     expect(config.owner).toEqual({ bound: true, staff_id: 'owner1', name: 'Name' });
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenCalledWith('https://hook', OWNER_GUIDE_TEXT);
+    expect(d.save).toHaveBeenCalledTimes(1);
+    expect(d.reply).toHaveBeenCalledTimes(1);
+    expect(d.reply).toHaveBeenCalledWith('https://hook', OWNER_GUIDE_TEXT);
 
-    await onDM(config, save, reply, 'owner1');
-    await onDM(config, save, reply, 'someone-else');
-    expect(save).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenCalledTimes(1);
+    const second = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'Name', sessionWebhook: 'https://hook', ...d });
+    const other = bindOwnerWithGuide({ config, staffId: 'u9', name: 'Other', sessionWebhook: 'https://hook', ...d });
+    expect(second).toEqual({ bound: false, guide: null });
+    expect(other).toEqual({ bound: false, guide: null });
+    expect(config.owner.staff_id).toBe('owner1');
+    expect(d.save).toHaveBeenCalledTimes(1);
+    expect(d.reply).toHaveBeenCalledTimes(1);
+    expect(d.sendDM).not.toHaveBeenCalled();
+  });
+
+  test('save failure -> not bound result, no guide', () => {
+    const config = { owner: { bound: false } };
+    const d = deps({ save: jest.fn().mockReturnValue(false) });
+    const res = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'N', sessionWebhook: 'https://hook', ...d });
+    expect(res).toEqual({ bound: false, guide: null });
+    expect(d.reply).not.toHaveBeenCalled();
+    expect(d.sendDM).not.toHaveBeenCalled();
+  });
+
+  test('no sessionWebhook -> falls back to proactive DM', async () => {
+    const config = { owner: { bound: false } };
+    const d = deps();
+    const res = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'N', sessionWebhook: undefined, ...d });
+    expect(await res.guide).toBe(true);
+    expect(d.reply).not.toHaveBeenCalled();
+    expect(d.sendDM).toHaveBeenCalledWith('owner1', OWNER_GUIDE_TEXT);
+  });
+
+  test('does not wait for the guide send (fire-and-forget)', () => {
+    const config = { owner: { bound: false } };
+    const d = deps({ reply: jest.fn(() => new Promise(() => {})) });
+    const res = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'N', sessionWebhook: 'h', ...d });
+    expect(res.bound).toBe(true);
+    expect(d.reply).toHaveBeenCalledTimes(1);
+  });
+
+  test('guide send failure is swallowed', async () => {
+    const config = { owner: { bound: false } };
+    const d = deps({ reply: jest.fn().mockRejectedValue(new Error('boom')) });
+    const res = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'N', sessionWebhook: 'h', ...d });
+    await expect(res.guide).resolves.toBe(false);
   });
 
   test('bindOwner returns false when already bound', () => {
     const save = jest.fn();
     expect(bindOwner({ owner: OWNER }, 'u1', 'X', save)).toBe(false);
     expect(save).not.toHaveBeenCalled();
-  });
-
-  test('bindOwner returns false when save fails (no guide)', async () => {
-    const config = { owner: { bound: false } };
-    const save = jest.fn().mockReturnValue(false);
-    const reply = jest.fn();
-    await onDM(config, save, reply, 'owner1');
-    expect(reply).not.toHaveBeenCalled();
-  });
-
-  test('sendOwnerGuide falls back to proactive DM without sessionWebhook', async () => {
-    const reply = jest.fn();
-    const sendDM = jest.fn().mockResolvedValue({});
-    expect(await sendOwnerGuide({ staffId: 'owner1', sessionWebhook: undefined, reply, sendDM })).toBe(true);
-    expect(reply).not.toHaveBeenCalled();
-    expect(sendDM).toHaveBeenCalledWith('owner1', OWNER_GUIDE_TEXT);
-  });
-
-  test('sendOwnerGuide swallows send errors', async () => {
-    const reply = jest.fn().mockRejectedValue(new Error('boom'));
-    await expect(sendOwnerGuide({ staffId: 'o', sessionWebhook: 'h', reply, sendDM: jest.fn() })).resolves.toBe(false);
   });
 });
