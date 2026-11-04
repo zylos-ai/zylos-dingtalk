@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - A non-array group `allowFrom` (e.g. a string) now denies access instead of substring-matching staff IDs.
+- Group `allowFrom` and DM `dmAllowFrom` entries are now compared as strings, so a numeric entry such as `123` matches staff ID `"123"`. A non-array `dmAllowFrom` denies access.
 
 ## [0.1.4] - 2026-06-01
 

@@ -16,6 +16,8 @@ import {
   sendOwnerGuide,
   checkGroupAccess,
   bindOwnerWithGuide,
+  checkDMPermission,
+  isInAllowList,
 } from '../src/lib/access.js';
 
 const OWNER = { bound: true, staff_id: 'owner1', name: 'Owner' };
@@ -202,6 +204,14 @@ describe('checkGroupAccess', () => {
     expect(reply).toHaveBeenCalledTimes(1);
   });
 
+  test('notice send rejecting with undefined/null is swallowed', async () => {
+    for (const value of [undefined, null]) {
+      const reply = jest.fn(() => Promise.reject(value));
+      const res = checkGroupAccess({ config: notEnabled, msg: groupMsg(), reply });
+      await expect(res.notice).resolves.toBe(false);
+    }
+  });
+
   test('notice send failure is swallowed', async () => {
     const reply = jest.fn().mockRejectedValue(new Error('boom'));
     const res = checkGroupAccess({ config: notEnabled, msg: groupMsg(), reply });
@@ -268,6 +278,15 @@ describe('bindOwnerWithGuide', () => {
     expect(d.reply).toHaveBeenCalledTimes(1);
   });
 
+  test('guide send rejecting with undefined/null is swallowed', async () => {
+    for (const value of [undefined, null]) {
+      const config = { owner: { bound: false } };
+      const d = deps({ reply: jest.fn(() => Promise.reject(value)) });
+      const res = bindOwnerWithGuide({ config, staffId: 'owner1', name: 'N', sessionWebhook: 'h', ...d });
+      await expect(res.guide).resolves.toBe(false);
+    }
+  });
+
   test('guide send failure is swallowed', async () => {
     const config = { owner: { bound: false } };
     const d = deps({ reply: jest.fn().mockRejectedValue(new Error('boom')) });
@@ -279,5 +298,29 @@ describe('bindOwnerWithGuide', () => {
     const save = jest.fn();
     expect(bindOwner({ owner: OWNER }, 'u1', 'X', save)).toBe(false);
     expect(save).not.toHaveBeenCalled();
+  });
+});
+
+describe('DM allowlist matching', () => {
+  test('isInAllowList compares entries as strings; non-array matches nothing', () => {
+    expect(isInAllowList([123], '123')).toBe(true);
+    expect(isInAllowList(['123'], 123)).toBe(true);
+    expect(isInAllowList(['u1'], 'u2')).toBe(false);
+    expect(isInAllowList('u1,u2', 'u1')).toBe(false);
+    expect(isInAllowList(undefined, 'u1')).toBe(false);
+  });
+
+  test('checkDMPermission: allowlist uses string-normalized matching', () => {
+    expect(checkDMPermission({ dmPolicy: 'allowlist', dmAllowFrom: [123] }, '123')).toBe(true);
+    expect(checkDMPermission({ dmPolicy: 'allowlist', dmAllowFrom: ['u2'] }, 'u1')).toBe(false);
+    expect(checkDMPermission({ dmPolicy: 'allowlist', dmAllowFrom: 'u1u2' }, 'u1')).toBe(false);
+    expect(checkDMPermission({ dmPolicy: 'allowlist' }, 'u1')).toBe(false);
+  });
+
+  test('checkDMPermission: policies and owner', () => {
+    expect(checkDMPermission({ dmPolicy: 'open' }, 'u1')).toBe(true);
+    expect(checkDMPermission({ dmPolicy: 'owner', dmAllowFrom: ['u1'] }, 'u1')).toBe(false);
+    expect(checkDMPermission({ dmPolicy: 'weird' }, 'u1')).toBe(false);
+    expect(checkDMPermission({ owner: OWNER, dmPolicy: 'owner' }, 'owner1')).toBe(true);
   });
 });

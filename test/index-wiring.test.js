@@ -254,6 +254,12 @@ describe('owner bind wiring', () => {
     expect(mockSendTextDM).toHaveBeenCalledWith(['boss4'], OWNER_GUIDE_TEXT);
   });
 
+  test('DM allowlist with numeric entry -> forwarded', async () => {
+    setConfig(baseConfig({ dmPolicy: 'allowlist', dmAllowFrom: [12345] }));
+    await dispatch(dmMsg({ senderStaffId: '12345' }));
+    expect(forwarded()).toBe(1);
+  });
+
   test('DM from non-owner when owner already bound -> no guide, not forwarded', async () => {
     setConfig(baseConfig());
     await dispatch(dmMsg({ senderStaffId: 'stranger' }));

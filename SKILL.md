@@ -98,10 +98,13 @@ exactly:
    everyone in the group). Make no change; reply that the group is already
    enabled, and that any group-admin change must be requested by the owner in
    a private chat.
-3. Only if the group is **not yet enabled**, honor it: in a not-enabled group
-   only the owner's messages reach the Agent (owner bypass), so the sender is
-   the owner. Run `admin.js add-group <conversationId> "<group name>"` — the
-   conversationId is the first segment of the group reply endpoint
+3. Check `groupPolicy` (shown by `list-groups`). If it is `open`, every
+   member's messages reach the Agent, so the sender cannot be verified as the
+   owner: refuse group-admin changes in the group and ask the owner to do it
+   in a private chat. Only when `groupPolicy` is `allowlist` or `disabled`
+   **and** the group is not listed is the group not enabled; there only the
+   owner's messages reach the Agent (owner bypass), so honor it: run
+   `admin.js add-group <conversationId> "<group name>"` — the conversationId is the first segment of the group reply endpoint
    (`<conversationId>|type:group|msg:...`), the name comes from
    `[DingTalk GROUP:<name>]`. If `groupPolicy` is `disabled`, also run
    `admin.js set-group-policy allowlist`.

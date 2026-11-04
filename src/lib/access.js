@@ -22,6 +22,28 @@ export function isOwner(config, staffId) {
 }
 
 /**
+ * Whether `staffId` appears in an allowlist array. Entries are compared as
+ * strings (so numeric 123 matches "123"); a non-array list matches nothing.
+ */
+export function isInAllowList(list, staffId) {
+  if (!Array.isArray(list)) return false;
+  return list.some(id => String(id) === String(staffId));
+}
+
+/**
+ * DM access check. Owner is always allowed; otherwise by dmPolicy.
+ */
+export function checkDMPermission(config, staffId) {
+  if (isOwner(config, staffId)) return true;
+  switch (config.dmPolicy) {
+    case 'open': return true;
+    case 'allowlist': return isInAllowList(config.dmAllowFrom, staffId);
+    case 'owner':
+    default: return false;
+  }
+}
+
+/**
  * Decide whether a group message is allowed.
  * Returns null when allowed, otherwise the deny reason:
  *   - DENY_GROUP_NOT_ENABLED: group policy disabled, or allowlist policy and
@@ -43,7 +65,7 @@ export function getGroupDenyReason(config, staffId, conversationId) {
       // Malformed (non-array) allowFrom fails closed instead of substring-matching.
       if (!Array.isArray(allowFrom)) return DENY_SENDER_NOT_ALLOWED;
       if (allowFrom.length === 0 || allowFrom.includes('*')) return null;
-      return allowFrom.some(id => String(id) === String(staffId)) ? null : DENY_SENDER_NOT_ALLOWED;
+      return isInAllowList(allowFrom, staffId) ? null : DENY_SENDER_NOT_ALLOWED;
     }
     case 'disabled':
     default:
@@ -87,7 +109,7 @@ export async function notifyGroupDenied(msg, reason, reply) {
     console.log(`[dingtalk] Group denied notice sent (${reason}) in ${msg.conversationId}`);
     return true;
   } catch (err) {
-    console.error(`[dingtalk] Failed to send group denied notice: ${err.message}`);
+    console.error(`[dingtalk] Failed to send group denied notice: ${err?.message ?? String(err)}`);
     return false;
   }
 }
@@ -142,7 +164,7 @@ export async function sendOwnerGuide({ staffId, sessionWebhook, reply, sendDM })
     console.log(`[dingtalk] Owner guide sent to ${staffId}`);
     return true;
   } catch (err) {
-    console.error(`[dingtalk] Failed to send owner guide: ${err.message}`);
+    console.error(`[dingtalk] Failed to send owner guide: ${err?.message ?? String(err)}`);
     return false;
   }
 }

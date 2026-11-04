@@ -19,6 +19,7 @@ import {
 } from './lib/message.js';
 import {
   isOwner as isOwnerInConfig,
+  checkDMPermission as checkDMPermissionInConfig,
   checkGroupAccess,
   bindOwnerWithGuide,
 } from './lib/access.js';
@@ -155,13 +156,7 @@ function isOwner(staffId) {
 }
 
 function checkDMPermission(staffId) {
-  if (isOwner(staffId)) return true;
-  switch (config.dmPolicy) {
-    case 'open': return true;
-    case 'owner': return false;
-    case 'allowlist': return (config.dmAllowFrom || []).includes(String(staffId));
-    default: return false;
-  }
+  return checkDMPermissionInConfig(config, staffId);
 }
 
 // --- Reply helpers for access-control notices ---
