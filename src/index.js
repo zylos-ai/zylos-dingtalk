@@ -14,7 +14,16 @@ import {
   downloadFileByCode,
   extractFileContent,
   cleanupMediaCache,
+  replyText,
+  sendTextDM,
 } from './lib/message.js';
+import {
+  isOwner as isOwnerInConfig,
+  getGroupDenyReason,
+  notifyGroupDenied,
+  bindOwner,
+  sendOwnerGuide,
+} from './lib/access.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -144,7 +153,7 @@ function getContextMessages(conversationId, currentMsgId) {
 
 // --- Permission checks ---
 function isOwner(staffId) {
-  return config.owner?.bound && config.owner.staff_id === String(staffId);
+  return isOwnerInConfig(config, staffId);
 }
 
 function checkDMPermission(staffId) {
@@ -157,28 +166,10 @@ function checkDMPermission(staffId) {
   }
 }
 
-function checkGroupPermission(staffId, conversationId) {
-  if (isOwner(staffId)) return true;
-  switch (config.groupPolicy) {
-    case 'disabled': return false;
-    case 'open': return true;
-    case 'allowlist': {
-      const groupConfig = config.groups?.[conversationId];
-      if (!groupConfig) return false;
-      if (!groupConfig.allowFrom || groupConfig.allowFrom.length === 0) return true;
-      if (groupConfig.allowFrom.includes('*')) return true;
-      return groupConfig.allowFrom.includes(String(staffId));
-    }
-    default: return false;
-  }
-}
-
 // --- Owner auto-binding ---
+// Returns true only when this call bound the owner and the config was saved.
 async function tryBindOwner(staffId, name) {
-  if (config.owner?.bound) return;
-  config.owner = { bound: true, staff_id: String(staffId), name };
-  saveConfig(config);
-  console.log(`[dingtalk] Owner bound: ${name} (${staffId})`);
+  return bindOwner(config, staffId, name, saveConfig);
 }
 
 // --- C4 forwarding ---
@@ -249,15 +240,27 @@ async function handleBotMessage(res) {
   if (isDM) {
     // Auto-bind owner on first DM
     if (!config.owner?.bound) {
-      await tryBindOwner(senderStaffId, userName);
+      const bound = await tryBindOwner(senderStaffId, userName);
+      if (bound) {
+        // One-time guide for the new owner; errors are swallowed inside.
+        await sendOwnerGuide({
+          staffId: senderStaffId,
+          sessionWebhook,
+          reply: (webhook, content) => replyText(webhook, content),
+          sendDM: (staffId, content) => sendTextDM([staffId], content),
+        });
+      }
     }
     if (!checkDMPermission(senderStaffId)) {
       console.log(`[dingtalk] DM denied: ${userName} (${senderStaffId})`);
       return;
     }
   } else {
-    if (!checkGroupPermission(senderStaffId, conversationId)) {
-      console.log(`[dingtalk] Group denied: ${userName} in ${conversationTitle}`);
+    const denyReason = getGroupDenyReason(config, senderStaffId, conversationId);
+    if (denyReason) {
+      console.log(`[dingtalk] Group denied (${denyReason}): ${userName} in ${conversationTitle}`);
+      // Only reply when the bot was @-mentioned; never to plain group chatter.
+      await notifyGroupDenied(msg, denyReason, (webhook, content) => replyText(webhook, content));
       return;
     }
   }

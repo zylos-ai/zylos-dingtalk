@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Blocked group messages that @-mention the bot now get a one-time reply: 「本群还没开通，请联系 Agent 管理者开启」 when the group is not enabled, or 「你在本群暂无权限使用我，请联系 Agent 管理者开通」 when the sender is not in the group's `allowFrom`. Non-mentions are still ignored silently.
+- After the first DM binds the owner, the bot sends the owner a one-time guide on how to enable groups and DMs; SKILL.md documents how the agent fulfils those owner requests.
+
 ## [0.1.4] - 2026-06-01
 
 ### Added

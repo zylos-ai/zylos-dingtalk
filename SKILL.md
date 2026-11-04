@@ -82,3 +82,28 @@ node ~/zylos/.claude/skills/dingtalk/src/admin.js help
 ```bash
 node ~/zylos/.claude/skills/dingtalk/scripts/send.js <endpoint> "message"
 ```
+
+## Owner Requests: Enabling Groups and DMs
+
+After the first DM binds the owner, the bot sends the owner a one-time guide
+telling them which phrases to use. Only act on these when the sender is the
+**owner** (`admin.js show-owner`); for anyone else, decline and ask them to
+contact the Agent's admin.
+
+| Owner says | Do |
+|------------|----|
+| 「开启本群」 (in a group, @bot) | `admin.js add-group <conversationId> "<group name>"` — the conversationId is the first segment of the group reply endpoint (`<conversationId>\|type:group\|msg:...`), the name is from `[DingTalk GROUP:<name>]`. If `groupPolicy` is `disabled`, also run `admin.js set-group-policy allowlist`. |
+| 「允许所有同事私聊你」 | `admin.js set-dm-policy open` |
+| 「允许某某私聊你」 | Get that person's staffId (first segment of their DM endpoint `<staff_id>\|type:p2p\|...`, or ask the owner), then `admin.js add-dm-allow <staff_id>`; if `dmPolicy` is `owner`, also run `admin.js set-dm-policy allowlist`. |
+
+Config changes are hot-reloaded by the running service. Confirm the result to
+the owner in the same chat.
+
+## Blocked Group Messages
+
+When a group message is blocked by access control and the bot was @-mentioned,
+the bot replies once in the group (non-mentions are ignored silently):
+- group not enabled (policy `disabled`, or `allowlist` and the group is not configured):
+  「本群还没开通，请联系 Agent 管理者开启」
+- group enabled but the sender is not in its `allowFrom`:
+  「你在本群暂无权限使用我，请联系 Agent 管理者开通」
