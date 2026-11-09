@@ -4,9 +4,9 @@ import fs from 'fs';
 import crypto from 'crypto';
 import http from 'http';
 import dotenv from 'dotenv';
-import { execFile } from 'child_process';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
+import { sendToC4 } from './lib/c4.js';
 import { getUserInfo } from './lib/contact.js';
 import {
   addThinkingEmoji,
@@ -26,7 +26,6 @@ import {
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const C4_RECEIVE = path.join(os.homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 
@@ -171,24 +170,6 @@ function tryBindOwner(staffId, name, sessionWebhook) {
     config, staffId, name, sessionWebhook,
     save: saveConfig, reply: replyWebhookText, sendDM: sendOwnerDM,
   }).bound;
-}
-
-// --- C4 forwarding ---
-function forwardToC4(channel, endpoint, content) {
-  const args = [
-    C4_RECEIVE,
-    '--channel', channel,
-    '--endpoint', endpoint,
-    '--json',
-    '--content', content,
-  ];
-
-  execFile('node', args, { timeout: 30000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error('[dingtalk] C4 forward error:', err.message);
-      if (stderr) console.error('[dingtalk] C4 stderr:', stderr);
-    }
-  });
 }
 
 // --- Message handler ---
@@ -346,7 +327,7 @@ async function handleBotMessage(res) {
       : `${senderStaffId}|type:p2p|msg:${msgId}`;
 
     // Store sessionWebhook in a temp map so send.js can use it
-    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
+    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime, senderStaffId);
 
     let c4Content = '';
 
@@ -372,7 +353,12 @@ async function handleBotMessage(res) {
     }
 
     // Forward to C4
-    forwardToC4('dingtalk', replyEndpoint, c4Content);
+    sendToC4('dingtalk', replyEndpoint, c4Content, (notice) => {
+      if (notice && sessionWebhook) {
+        replyWebhookText(sessionWebhook, notice).catch(err =>
+          console.error(`[dingtalk] Failed to send C4 reject notice: ${err?.message ?? String(err)}`));
+      }
+    });
 
     console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName} (msgtype=${msgtype}, len=${contentText.length})`);
   } finally {
@@ -392,9 +378,9 @@ async function handleBotMessage(res) {
 const sessionWebhooks = new Map();
 const WEBHOOK_CLEANUP_INTERVAL = 60000;
 
-function storeSessionWebhook(endpoint, webhookUrl, expiresAt) {
+function storeSessionWebhook(endpoint, webhookUrl, expiresAt, senderStaffId) {
   if (!webhookUrl) return;
-  sessionWebhooks.set(endpoint, { url: webhookUrl, expiresAt });
+  sessionWebhooks.set(endpoint, { url: webhookUrl, expiresAt, senderStaffId: String(senderStaffId ?? '') });
 }
 
 // Clean up expired webhooks
@@ -442,7 +428,9 @@ function startInternalServer(port) {
           const wh = sessionWebhooks.get(endpoint);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           if (wh && Date.now() < wh.expiresAt) {
-            res.end(JSON.stringify({ ok: true, url: wh.url }));
+            // senderStaffId: who wrote the accepted inbound message; send.js
+            // uses it to allow owner replies to non-allowlisted groups.
+            res.end(JSON.stringify({ ok: true, url: wh.url, senderStaffId: wh.senderStaffId }));
           } else {
             res.end(JSON.stringify({ ok: false }));
           }

@@ -1,6 +1,6 @@
 ---
 name: dingtalk
-version: 0.2.0
+version: 0.3.0
 description: >
   DingTalk (钉钉) communication channel. Receives messages via Stream mode
   (WebSocket) and sends messages via DingTalk REST API. Use when:
@@ -72,6 +72,38 @@ Connects DingTalk (钉钉) to the Zylos agent via C4 Communication Bridge.
 - LLM-powered message merging for queued messages
 - Private IP detection for DingTalk gateway endpoint
 - Log sanitization (no user content in logs)
+
+## Session Groups (multi-session Core)
+
+With a zylos-core that supports multi-session, each inbound message carries a
+session group, so every DingTalk conversation gets its own conversation thread.
+Replies still go through the same `reply via` path.
+
+| Conversation | Session group | Example |
+|---|---|---|
+| 1:1 chat | `dm-<staffId>` | `dm-manager4567` |
+| Group | `group-<conversationId>` | `group-cidAbC-dE_f12` |
+
+- Conversation ids are base64; `+` becomes `-`, `/` becomes `_`, trailing `=`
+  is dropped so the name is valid for Core.
+- The group is passed only if the installed Core lists `--session-group` in
+  `c4-receive-options.json`; older Cores behave exactly as before.
+
+```bash
+node ~/zylos/.claude/skills/dingtalk/scripts/session-group.js "<endpoint>"
+```
+
+## Outbound Policy
+
+`send.js` checks the destination before sending (and again for queued
+retries):
+- **DM:** only to the owner or users the DM policy allows (`dmPolicy` /
+  `dmAllowFrom`).
+- **Group:** only enabled groups (`groupPolicy: open`, or listed under
+  `groups`). In any other group, including `groupPolicy: disabled`, only a
+  reply to a message the owner sent there is allowed, while its reply link is
+  still valid (about 1-2 hours, lost on component restart).
+- Blocked sends exit 1 with `outbound blocked` and are not queued.
 
 ## Admin CLI
 ```bash

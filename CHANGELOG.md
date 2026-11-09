@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-09
+
+### Added
+- Session groups for multi-session zylos-core: DMs are `dm-<staffId>`, groups
+  `group-<conversationId>` (base64 `+`/`/` mapped to `-`/`_`, `=` padding
+  dropped, since Core only accepts `[A-Za-z0-9_.:-]`). `--session-group` is
+  passed only when the installed Core lists it in `c4-receive-options.json`,
+  so older Cores see unchanged args.
+- `scripts/session-group.js <endpoint>` prints the group for an endpoint.
+- Outbound destination policy in `send.js`, checked on every attempt
+  (including queued retries): DMs only to staffIds the inbound DM policy
+  accepts (owner always); groups only when enabled (`open`, or listed for
+  `allowlist`), otherwise only a reply to an accepted owner message, proven by
+  the sender the component recorded with that message's sessionWebhook.
+  Blocked sends exit 1 with `outbound blocked` and are not queued.
+
+### Changed
+- c4-receive rejections follow `error.persisted`: already stored -> no reply
+  and no resend; nothing stored -> 「抱歉，这条消息暂时没能处理，请稍后再试。」;
+  unknown -> 「抱歉，这条消息可能没有送达……」. Core's raw error text only goes
+  to the log. A rejected group is never resent to the overall group.
+- No 30s timeout on c4-receive: killing it after Core stored the row and
+  retrying would deliver the message twice. Unstructured failures retry once.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

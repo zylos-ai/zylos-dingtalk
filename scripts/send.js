@@ -20,6 +20,9 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { withRetry, isRetryable, MAX_RETRIES } from '../src/lib/retry.js';
+import { getConfig } from '../src/lib/config.js';
+import { outboundDenialReason } from '../src/lib/outbound.js';
+import { parseEndpoint } from '../src/lib/session-group.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -37,19 +40,6 @@ const message = msgParts.join(' ');
 if (!endpoint || !message) {
   console.error('Usage: send.js <endpoint> <message>');
   process.exit(1);
-}
-
-// --- Parse endpoint ---
-function parseEndpoint(ep) {
-  const parts = ep.split('|');
-  const result = { id: parts[0] };
-  for (const part of parts.slice(1)) {
-    const idx = part.indexOf(':');
-    if (idx > 0) {
-      result[part.slice(0, idx)] = part.slice(idx + 1);
-    }
-  }
-  return result;
 }
 
 // --- Internal API helpers ---
@@ -75,9 +65,13 @@ async function internalRequest(urlPath, data) {
   }
 }
 
-async function getSessionWebhook(ep) {
+async function getWebhookRecord(ep) {
   const result = await internalRequest('/internal/get-webhook', { endpoint: ep });
-  return result?.ok ? result.url : null;
+  return result?.ok ? result : null;
+}
+
+async function getSessionWebhook(ep) {
+  return (await getWebhookRecord(ep))?.url || null;
 }
 
 async function recordOutgoing(chatId, text) {
@@ -604,6 +598,13 @@ async function sendMedia(ep, type, filePath) {
 async function sendMessage(endpointStr, msg) {
   const ep = parseEndpoint(endpointStr);
   const isGroup = ep.type === 'group';
+
+  // Checked on every attempt, including queued retries, against live config.
+  let reason = outboundDenialReason(getConfig(), ep);
+  if (reason && isGroup && ep.msg) {
+    reason = outboundDenialReason(getConfig(), ep, await getWebhookRecord(endpointStr));
+  }
+  if (reason) throw new Error(`outbound blocked: ${reason}`);
 
   // Check for media
   const mediaMatch = msg.match(/^\[MEDIA:(\w+)\](.+)$/);
