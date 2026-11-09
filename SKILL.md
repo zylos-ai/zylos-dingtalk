@@ -82,10 +82,10 @@ Replies still go through the same `reply via` path.
 | Conversation | Session group | Example |
 |---|---|---|
 | 1:1 chat | `dm-<staffId>` | `dm-manager4567` |
-| Group | `group-<conversationId>` | `group-cidAbC-dE_f12` |
+| Group | `group-<conversationId>` | `group-cidAbC-dE_f12..` |
 
-- Conversation ids are base64; `+` becomes `-`, `/` becomes `_`, trailing `=`
-  is dropped so the name is valid for Core.
+- Conversation ids are base64; `+` becomes `-`, `/` becomes `_`, `=` becomes
+  `.` (reversible, so names stay one-to-one) to make the name valid for Core.
 - The group is passed only if the installed Core lists `--session-group` in
   `c4-receive-options.json`; older Cores behave exactly as before.
 

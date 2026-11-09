@@ -87,7 +87,7 @@ message's author, which is why the proof is component-held.
 ### Session Groups
 
 Inbound messages carry `--session-group` (`dm-<staffId>` /
-`group-<conversationId>`, base64url-mapped) when Core advertises the option in
+`group-<conversationId>`, base64 `+`/`/`/`=` mapped to `-`/`_`/`.`) when Core advertises the option in
 `c4-receive-options.json` (`src/lib/c4.js`, `src/lib/session-group.js`).
 
 ## Configuration

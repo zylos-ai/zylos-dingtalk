@@ -8,8 +8,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Session groups for multi-session zylos-core: DMs are `dm-<staffId>`, groups
-  `group-<conversationId>` (base64 `+`/`/` mapped to `-`/`_`, `=` padding
-  dropped, since Core only accepts `[A-Za-z0-9_.:-]`). `--session-group` is
+  `group-<conversationId>` (base64 `+`/`/`/`=` mapped reversibly to
+  `-`/`_`/`.`, since Core only accepts `[A-Za-z0-9_.:-]`). `--session-group` is
   passed only when the installed Core lists it in `c4-receive-options.json`,
   so older Cores see unchanged args.
 - `scripts/session-group.js <endpoint>` prints the group for an endpoint.

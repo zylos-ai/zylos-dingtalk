@@ -1,8 +1,8 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFileSync } from 'child_process';
-import { sessionGroupFromEndpoint } from '../src/lib/session-group.js';
+import { execFileSync, spawnSync } from 'child_process';
+import { isValidSessionGroup, sessionGroupFromEndpoint } from '../src/lib/session-group.js';
 import { buildC4ReceiveArgs, classifyC4Rejection, sendToC4, GENERIC_REJECT_REPLY, UNCERTAIN_REPLY } from '../src/lib/c4.js';
 
 describe('sessionGroupFromEndpoint', () => {
@@ -15,7 +15,7 @@ describe('sessionGroupFromEndpoint', () => {
   });
 
   test('group maps base64 conversation ids to a Core-safe name', () => {
-    expect(sessionGroupFromEndpoint('cidAbC+dE/f12==|type:group|msg:m1')).toBe('group-cidAbC-dE_f12');
+    expect(sessionGroupFromEndpoint('cidAbC+dE/f12==|type:group|msg:m1')).toBe('group-cidAbC-dE_f12..');
   });
 
   test('per-message parts never change the group', () => {
@@ -28,15 +28,36 @@ describe('sessionGroupFromEndpoint', () => {
     expect(sessionGroupFromEndpoint('abc|type:p2p')).not.toBe(sessionGroupFromEndpoint('abc|type:group'));
   });
 
+  test.each([
+    'manager4567|type:p2p|msg:m1',
+    '0123456',
+    'cidAbC+dE/f12==|type:group|msg:m1',
+    'cid0vsfKhFEAAAAAAAAAAAA+xY/Z9==|type:group',
+  ])('every output is Core-valid: %s', (ep) => {
+    expect(isValidSessionGroup(sessionGroupFromEndpoint(ep))).toBe(true);
+  });
+
+  test('mapping is reversible (one-to-one)', () => {
+    const ids = ['cidA+B=', 'cidA/B=', 'cidA+B', 'cidAB==', 'cidAB='];
+    const names = ids.map(id => sessionGroupFromEndpoint(`${id}|type:group`));
+    expect(new Set(names).size).toBe(ids.length);
+  });
+
   test('rejects empty, invalid or overlong ids', () => {
     expect(() => sessionGroupFromEndpoint('')).toThrow();
     expect(() => sessionGroupFromEndpoint('a b|type:p2p')).toThrow();
     expect(() => sessionGroupFromEndpoint(`${'x'.repeat(100)}|type:group`)).toThrow();
   });
 
+  test('CLI fails with exit 1 and no stdout on an invalid endpoint', () => {
+    const r = spawnSync(process.execPath, ['scripts/session-group.js', ''], { encoding: 'utf8' });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe('');
+  });
+
   test('CLI prints the group', () => {
     const out = execFileSync(process.execPath, ['scripts/session-group.js', 'cidQ+1=|type:group|msg:9'], { encoding: 'utf8' });
-    expect(out).toBe('group-cidQ-1\n');
+    expect(out).toBe('group-cidQ-1.\n');
   });
 });
 

@@ -6,14 +6,25 @@
  * agree. Rules (fixed once live; changing them needs a migration):
  *   1:1 chat  `<staffId>|type:p2p|...`        -> dm-<staffId>
  *   group     `<conversationId>|type:group|...` -> group-<conversationId>
- * Core only accepts [A-Za-z0-9_.:-], so the id is made base64url-safe:
- * `+` -> `-`, `/` -> `_`, trailing `=` padding dropped. DingTalk
- * conversation ids are base64 (no `-`/`_`), so the mapping stays unique.
+ * Core only accepts [A-Za-z0-9_.:-], so the id is mapped reversibly:
+ * `+` -> `-`, `/` -> `_`, `=` -> `.`. DingTalk conversation ids are base64
+ * (no `-`, `_` or `.`), so the mapping stays one-to-one.
  * The component never adds a namespace; Core does.
  */
 
-export const MAX_GROUP_LENGTH = 95;
-const GROUP_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+/** Core's limits for the name a component passes (Core adds `<namespace>:`). */
+export const SESSION_GROUP_MAX_LENGTH = 95;
+export const SESSION_GROUP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+
+/**
+ * Whether Core would accept this nonempty name.
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function isValidSessionGroup(name) {
+  return typeof name === 'string' && name.length <= SESSION_GROUP_MAX_LENGTH
+    && SESSION_GROUP_PATTERN.test(name);
+}
 
 export function parseEndpoint(ep) {
   const parts = String(ep ?? '').split('|');
@@ -26,7 +37,7 @@ export function parseEndpoint(ep) {
 }
 
 function safeId(id) {
-  return String(id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return String(id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '.');
 }
 
 /**
@@ -38,7 +49,7 @@ export function sessionGroupFromEndpoint(endpoint) {
   const ep = parseEndpoint(endpoint);
   if (!ep.id) throw new Error(`invalid DingTalk endpoint: ${JSON.stringify(String(endpoint ?? '').slice(0, 64))}`);
   const name = `${ep.type === 'group' ? 'group' : 'dm'}-${safeId(ep.id)}`;
-  if (name.length > MAX_GROUP_LENGTH || !GROUP_NAME.test(name)) {
+  if (!isValidSessionGroup(name)) {
     throw new Error(`cannot map endpoint id to a session group: ${JSON.stringify(ep.id.slice(0, 64))}`);
   }
   return name;
