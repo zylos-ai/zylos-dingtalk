@@ -47,10 +47,10 @@ describe('outbound group policy', () => {
     expect(outboundDenialReason(allowlist, ep('cidX', 'group', 'm1'), { senderStaffId: 'u-x' })).not.toBeNull();
   });
 
-  test('disabled: owner reply allowed, everything else blocked', () => {
+  test('disabled: everything blocked, owner replies included', () => {
     const disabled = { ...allowlist, groupPolicy: 'disabled' };
     expect(outboundDenialReason(disabled, ep('cidA', 'group'))).not.toBeNull();
-    expect(outboundDenialReason(disabled, ep('cidA', 'group', 'm1'), { senderStaffId: 'u-owner' })).toBeNull();
+    expect(outboundDenialReason(disabled, ep('cidA', 'group', 'm1'), { senderStaffId: 'u-owner' })).not.toBeNull();
   });
 
   test('no owner bound: inbound proof alone is not enough', () => {

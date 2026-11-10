@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
   Blocked sends exit 1 with `outbound blocked` and are not queued.
 
 ### Changed
+- `groupPolicy: disabled` now rejects the owner too, inbound and outbound
+  (aligned with Telegram). The owner still bypasses the group allowlist.
 - c4-receive rejections follow `error.persisted`: already stored -> no reply
   and no resend; nothing stored -> 「抱歉，这条消息暂时没能处理，请稍后再试。」;
   unknown -> 「抱歉，这条消息可能没有送达……」. Core's raw error text only goes

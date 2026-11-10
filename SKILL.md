@@ -100,9 +100,11 @@ retries):
 - **DM:** only to the owner or users the DM policy allows (`dmPolicy` /
   `dmAllowFrom`).
 - **Group:** only enabled groups (`groupPolicy: open`, or listed under
-  `groups`). In any other group, including `groupPolicy: disabled`, only a
-  reply to a message the owner sent there is allowed, while its reply link is
+  `groups`). In a group that is not enabled, only a reply to a message the
+  owner sent there is allowed, while its reply link is
   still valid (about 1-2 hours, lost on component restart).
+- `groupPolicy: disabled` blocks every group send, owner replies included
+  (inbound rejects the owner too, same as Telegram).
 - Blocked sends exit 1 with `outbound blocked` and are not queued.
 
 ## Admin CLI
@@ -133,13 +135,14 @@ exactly:
 3. Check `groupPolicy` (shown by `list-groups`). If it is `open`, every
    member's messages reach the Agent, so the sender cannot be verified as the
    owner: refuse group-admin changes in the group and ask the owner to do it
-   in a private chat. Only when `groupPolicy` is `allowlist` or `disabled`
-   **and** the group is not listed is the group not enabled; there only the
-   owner's messages reach the Agent (owner bypass), so honor it: run
+   in a private chat. Only when `groupPolicy` is `allowlist` **and** the
+   group is not listed is the group not enabled; there only the owner's
+   messages reach the Agent (owner bypass), so honor it: run
    `admin.js add-group <conversationId> "<group name>"` — the conversationId is the first segment of the group reply endpoint
    (`<conversationId>|type:group|msg:...`), the name comes from
-   `[DingTalk GROUP:<name>]`. If `groupPolicy` is `disabled`, also run
-   `admin.js set-group-policy allowlist`.
+   `[DingTalk GROUP:<name>]`. With `groupPolicy: disabled` no group message
+   reaches the Agent, the owner's included; the owner has to ask in a private
+   chat, then run `admin.js set-group-policy allowlist` and `add-group`.
 4. In an already-enabled group, refuse every other group-admin change
    (allowFrom, remove-group, policy) and ask the owner to do it in a private
    chat.

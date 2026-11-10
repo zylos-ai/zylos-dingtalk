@@ -5,8 +5,8 @@
  * accepts (owner always; then dmPolicy / dmAllowFrom). A group (`type:group`)
  * must pass the group policy (open, or listed under `groups` for allowlist);
  * otherwise only a reply to an accepted inbound message written by the owner
- * is allowed, so owner conversations in non-enabled groups (including
- * groupPolicy=disabled) keep working. The proof is the sender recorded with
+ * is allowed, so owner conversations in non-enabled groups keep working.
+ * groupPolicy=disabled blocks every group send, owner replies included. The proof is the sender recorded with
  * that message's sessionWebhook by the running component; once the webhook
  * expires or the component restarts, such a reply is denied, never wrongly
  * allowed.
@@ -27,6 +27,7 @@ export function outboundDenialReason(config, ep, inbound = null) {
   if (ep.type === 'group') {
     if (config.groupPolicy === 'open') return null;
     if (config.groupPolicy === 'allowlist' && Object.hasOwn(config.groups || {}, ep.id)) return null;
+    if (config.groupPolicy === 'disabled') return 'groupPolicy=disabled';
     if (inbound?.senderStaffId && isOwner(config, inbound.senderStaffId)) return null;
     return `group ${ep.id} is not enabled (groupPolicy=${config.groupPolicy}) and the message is not a reply to the owner`;
   }

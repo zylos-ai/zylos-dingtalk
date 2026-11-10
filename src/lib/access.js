@@ -52,6 +52,9 @@ export function checkDMPermission(config, staffId) {
  *     allowFrom list
  */
 export function getGroupDenyReason(config, staffId, conversationId) {
+  // groupPolicy=disabled rejects everyone, the owner included (same as Telegram);
+  // otherwise the owner bypasses the group allowlist.
+  if (config.groupPolicy === 'disabled') return DENY_GROUP_NOT_ENABLED;
   if (isOwner(config, staffId)) return null;
   switch (config.groupPolicy) {
     case 'open':
