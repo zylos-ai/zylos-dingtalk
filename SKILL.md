@@ -86,6 +86,13 @@ Replies still go through the same `reply via` path.
 
 - Conversation ids are base64; `+` becomes `-`, `/` becomes `_`, `=` becomes
   `.` (reversible, so names stay one-to-one) to make the name valid for Core.
+- A staffId outside Core's alphabet (e.g. `zhang@abc`, Chinese, spaces, or not
+  starting with a letter/digit) is never rejected: it gets a local short id
+  such as `dm-_1794548699297`, assigned once and kept in
+  `~/zylos/components/dingtalk/session-groups.json` (plus `.bak`). Inbound and
+  `session-group.js` use the same store, so the name is stable. Do not edit or
+  delete that file; if it is corrupt, those users' messages are refused until
+  it is fixed (it is never reset, so names are never reused).
 - The group is passed only if the installed Core lists `--session-group` in
   `c4-receive-options.json`; older Cores behave exactly as before.
 

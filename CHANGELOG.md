@@ -9,9 +9,12 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Session groups for multi-session zylos-core: DMs are `dm-<staffId>`, groups
   `group-<conversationId>` (base64 `+`/`/`/`=` mapped to `-`/`_`/`.`, since
-  Core only accepts `[A-Za-z0-9_.:-]`). Ids that do not conform (non-base64
-  conversation ids, staffIds with characters outside Core's alphabet) are
-  rejected rather than mapped, so the mapping is one-to-one for any input. `--session-group` is
+  Core only accepts `[A-Za-z0-9_.:-]`). Non-base64 conversation ids are
+  rejected. A staffId outside Core's alphabet (or not starting with a
+  letter/digit) gets a local short id `dm-_<n>` kept in
+  `session-groups.json` (atomic, fsynced, 0600, with `.bak`; never reused;
+  a corrupt store is an error, never reset), so no user is rejected for their
+  staffId and names stay one-to-one. `--session-group` is
   passed only when the installed Core lists it in `c4-receive-options.json`,
   so older Cores see unchanged args.
 - `scripts/session-group.js <endpoint>` prints the group for an endpoint.

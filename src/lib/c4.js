@@ -92,8 +92,9 @@ export function parseC4Response(stdout) {
  * @param {number} [opts.retryDelayMs=2000]
  * @param {function} [opts.onDone] - Test hook: called with the final outcome
  * @param {function} [opts.exec] - Test hook replacing child_process.execFile
+ * @param {string} [opts.groupStorePath] - Test hook: short-id store path
  */
-export function sendToC4(channel, endpoint, content, onReject, { retryDelayMs = 2000, onDone, exec = execFile } = {}) {
+export function sendToC4(channel, endpoint, content, onReject, { retryDelayMs = 2000, onDone, exec = execFile, groupStorePath } = {}) {
   const done = (outcome) => { if (onDone) onDone(outcome); };
   if (!content) {
     console.error('[dingtalk] sendToC4 called with empty content');
@@ -104,7 +105,7 @@ export function sendToC4(channel, endpoint, content, onReject, { retryDelayMs = 
   // endpoint is delivered as before (0.2.0), whatever its staffId.
   let sessionGroup;
   try {
-    if (c4ReceiveSupportsOption('--session-group')) sessionGroup = sessionGroupFromEndpoint(endpoint);
+    if (c4ReceiveSupportsOption('--session-group')) sessionGroup = sessionGroupFromEndpoint(endpoint, groupStorePath ? { storePath: groupStorePath } : {});
   } catch (err) {
     // Never fall back to the overall group.
     console.error(`[dingtalk] cannot derive session group, not sending: ${err.message}`);

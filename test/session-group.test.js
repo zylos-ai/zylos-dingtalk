@@ -49,17 +49,14 @@ describe('sessionGroupFromEndpoint', () => {
     expect(() => sessionGroupFromEndpoint('cid.A|type:group')).toThrow(/not base64/);
   });
 
-  test('staffIds are not rewritten: + / = are rejected, so a+b and a-b cannot collide', () => {
-    expect(() => sessionGroupFromEndpoint('a+b|type:p2p')).toThrow(/staffId/);
-    expect(() => sessionGroupFromEndpoint('a/b|type:p2p')).toThrow(/staffId/);
-    expect(() => sessionGroupFromEndpoint('a=b|type:p2p')).toThrow(/staffId/);
+  test('compliant staffIds are unchanged; + / = no longer collide with -', () => {
     expect(sessionGroupFromEndpoint('a-b|type:p2p')).toBe('dm-a-b');
     expect(sessionGroupFromEndpoint('a_b.c:d|type:p2p')).toBe('dm-a_b.c:d');
+    expect(sessionGroupFromEndpoint('manager4567|type:p2p')).toBe('dm-manager4567');
   });
 
-  test('rejects empty, invalid or overlong ids', () => {
+  test('rejects empty endpoints and invalid or overlong group ids', () => {
     expect(() => sessionGroupFromEndpoint('')).toThrow();
-    expect(() => sessionGroupFromEndpoint('a b|type:p2p')).toThrow();
     expect(() => sessionGroupFromEndpoint(`${'x'.repeat(100)}|type:group`)).toThrow();
   });
 
@@ -72,6 +69,76 @@ describe('sessionGroupFromEndpoint', () => {
   test('CLI prints the group', () => {
     const out = execFileSync(process.execPath, ['scripts/session-group.js', 'cidQ+1=|type:group|msg:9'], { encoding: 'utf8' });
     expect(out).toBe('group-cidQ-1.\n');
+  });
+});
+
+describe('short ids for non-compliant staffIds', () => {
+  let dir, store;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-sg-'));
+    store = path.join(dir, 'session-groups.json');
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sg = (ep, now) => sessionGroupFromEndpoint(ep, { storePath: store, ...(now ? { now } : {}) });
+
+  test('compliant staffId is unchanged and writes no store', () => {
+    expect(sg('manager4567|type:p2p')).toBe('dm-manager4567');
+    expect(fs.existsSync(store)).toBe(false);
+  });
+
+  test('zhang@abc gets a stable dm-_<n>, persisted 0600', () => {
+    const a = sg('zhang@abc|type:p2p|msg:1');
+    expect(a).toMatch(/^dm-_\d+$/);
+    expect(isValidSessionGroup(a)).toBe(true);
+    expect(sg('zhang@abc|type:p2p|msg:2')).toBe(a);
+    expect(sg('zhang@abc')).toBe(a);
+    expect(fs.statSync(store).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(fs.readFileSync(`${store}.bak`, 'utf8')).ids['zhang@abc']).toBe(a);
+  });
+
+  test.each(['张三', 'a b', '_1', 'a+b', 'x'.repeat(100)])('non-compliant %s maps to a short id', (id) => {
+    expect(sg(`${id}|type:p2p`)).toMatch(/^dm-_\d+$/);
+  });
+
+  test('different bad ids get different groups; numbers never reused after store loss', () => {
+    const a = sg('zhang@abc|type:p2p', () => 5);
+    const b = sg('李四|type:p2p', () => 5);
+    expect(a).not.toBe(b);
+    fs.rmSync(store); fs.rmSync(`${store}.bak`);
+    const c = sg('wang@abc|type:p2p');
+    expect([a, b]).not.toContain(c);
+  });
+
+  test('a missing store is restored from .bak', () => {
+    const a = sg('zhang@abc|type:p2p');
+    fs.rmSync(store);
+    expect(sg('zhang@abc|type:p2p')).toBe(a);
+  });
+
+  test('corrupt or invalid store errors and is left untouched', () => {
+    fs.writeFileSync(store, '{not json');
+    expect(() => sg('zhang@abc|type:p2p')).toThrow(/not valid JSON/);
+    expect(fs.readFileSync(store, 'utf8')).toBe('{not json');
+    fs.writeFileSync(store, JSON.stringify({ ids: { x: 'dm-x' }, next: 1 }));
+    expect(() => sg('zhang@abc|type:p2p')).toThrow(/invalid/);
+    // compliant ids never touch the store
+    expect(sg('ok1|type:p2p')).toBe('dm-ok1');
+  });
+
+  test('inbound and scripts/session-group.js agree (same store)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-home-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      const cli = (ep) => execFileSync(process.execPath, ['scripts/session-group.js', ep], { encoding: 'utf8', env }).trim();
+      const first = cli('zhang@abc|type:p2p|msg:1');
+      expect(first).toMatch(/^dm-_\d+$/);
+      const realStore = path.join(home, 'zylos/components/dingtalk/session-groups.json');
+      expect(sessionGroupFromEndpoint('zhang@abc|type:p2p|msg:2', { storePath: realStore })).toBe(first);
+      expect(cli('zhang@abc|type:p2p')).toBe(first);
+      expect(cli('other@abc|type:p2p')).not.toBe(first);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -196,17 +263,29 @@ describe('sendToC4 session group resolution', () => {
     const calls = [];
     const exec = (_bin, args, _opts, cb) => { calls.push(args); cb(null, ''); };
     sendToC4('dingtalk', endpoint, 'hi', (n) => notices.push(n),
-      { exec, retryDelayMs: 1, onDone: (outcome) => resolve({ outcome, notices, calls }) });
+      { exec, retryDelayMs: 1, groupStorePath: path.join(dir, 'session-groups.json'), onDone: (outcome) => resolve({ outcome, notices, calls }) });
   });
 
   test('new Core: invalid endpoint is never sent to the overall group', async () => {
     supportGroups();
-    expect(await send('a b|type:p2p')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+    expect(await send('cid-x|type:group')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
   });
 
-  test('new Core: user@corp staffId is rejected (unchanged)', async () => {
+  test('new Core: user@corp staffId is delivered with a stable short group', async () => {
     supportGroups();
+    const first = await send('user@corp|type:p2p|msg:m');
+    expect(first.outcome).toBe('sent');
+    const g = first.calls[0][first.calls[0].indexOf('--session-group') + 1];
+    expect(g).toMatch(/^dm-_\d+$/);
+    const again = await send('user@corp|type:p2p|msg:n');
+    expect(again.calls[0][again.calls[0].indexOf('--session-group') + 1]).toBe(g);
+  });
+
+  test('new Core: corrupt short-id store rejects instead of resetting', async () => {
+    supportGroups();
+    fs.writeFileSync(path.join(dir, 'session-groups.json'), 'garbage');
     expect(await send('user@corp|type:p2p|msg:m')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+    expect(await send('u1|type:p2p|msg:m')).toMatchObject({ outcome: 'sent' });
   });
 
   test('new Core: valid endpoint carries --session-group', async () => {
