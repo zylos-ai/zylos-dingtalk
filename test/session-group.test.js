@@ -1,0 +1,306 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { execFileSync, spawnSync } from 'child_process';
+import { isValidSessionGroup, sessionGroupFromEndpoint } from '../src/lib/session-group.js';
+import { buildC4ReceiveArgs, classifyC4Rejection, sendToC4, GENERIC_REJECT_REPLY, UNCERTAIN_REPLY } from '../src/lib/c4.js';
+
+describe('sessionGroupFromEndpoint', () => {
+  test('DM maps to dm-<staffId>', () => {
+    expect(sessionGroupFromEndpoint('manager4567|type:p2p|msg:m1')).toBe('dm-manager4567');
+  });
+
+  test('endpoint without type is a DM (matches send.js)', () => {
+    expect(sessionGroupFromEndpoint('0123456')).toBe('dm-0123456');
+  });
+
+  test('group maps base64 conversation ids to a Core-safe name', () => {
+    expect(sessionGroupFromEndpoint('cidAbC+dE/f12==|type:group|msg:m1')).toBe('group-cidAbC-dE_f12..');
+  });
+
+  test('per-message parts never change the group', () => {
+    const a = sessionGroupFromEndpoint('cidX1|type:group|msg:m1');
+    const b = sessionGroupFromEndpoint('cidX1|type:group|msg:m2');
+    expect(a).toBe(b);
+  });
+
+  test('DM and group with the same id stay separate', () => {
+    expect(sessionGroupFromEndpoint('abc|type:p2p')).not.toBe(sessionGroupFromEndpoint('abc|type:group'));
+  });
+
+  test.each([
+    'manager4567|type:p2p|msg:m1',
+    '0123456',
+    'cidAbC+dE/f12==|type:group|msg:m1',
+    'cid0vsfKhFEAAAAAAAAAAAA+xY/Z9==|type:group',
+  ])('every output is Core-valid: %s', (ep) => {
+    expect(isValidSessionGroup(sessionGroupFromEndpoint(ep))).toBe(true);
+  });
+
+  test('mapping is reversible (one-to-one)', () => {
+    const ids = ['cidA+B=', 'cidA/B=', 'cidA+B', 'cidAB==', 'cidAB='];
+    const names = ids.map(id => sessionGroupFromEndpoint(`${id}|type:group`));
+    expect(new Set(names).size).toBe(ids.length);
+  });
+
+  test('rejects non-base64 group ids instead of relying on the alphabet', () => {
+    expect(() => sessionGroupFromEndpoint('cid-A|type:group')).toThrow(/not base64/);
+    expect(() => sessionGroupFromEndpoint('cid_A|type:group')).toThrow(/not base64/);
+    expect(() => sessionGroupFromEndpoint('cid.A|type:group')).toThrow(/not base64/);
+  });
+
+  test('compliant staffIds are unchanged; + / = no longer collide with -', () => {
+    expect(sessionGroupFromEndpoint('a-b|type:p2p')).toBe('dm-a-b');
+    expect(sessionGroupFromEndpoint('a_b.c:d|type:p2p')).toBe('dm-a_b.c:d');
+    expect(sessionGroupFromEndpoint('manager4567|type:p2p')).toBe('dm-manager4567');
+  });
+
+  test('rejects empty endpoints and invalid or overlong group ids', () => {
+    expect(() => sessionGroupFromEndpoint('')).toThrow();
+    expect(() => sessionGroupFromEndpoint(`${'x'.repeat(100)}|type:group`)).toThrow();
+  });
+
+  test('CLI fails with exit 1 and no stdout on an invalid endpoint', () => {
+    const r = spawnSync(process.execPath, ['scripts/session-group.js', ''], { encoding: 'utf8' });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe('');
+  });
+
+  test('CLI prints the group', () => {
+    const out = execFileSync(process.execPath, ['scripts/session-group.js', 'cidQ+1=|type:group|msg:9'], { encoding: 'utf8' });
+    expect(out).toBe('group-cidQ-1.\n');
+  });
+});
+
+describe('short ids for non-compliant staffIds', () => {
+  let dir, store;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-sg-'));
+    store = path.join(dir, 'session-groups.json');
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sg = (ep, now) => sessionGroupFromEndpoint(ep, { storePath: store, ...(now ? { now } : {}) });
+
+  test('compliant staffId is unchanged and writes no store', () => {
+    expect(sg('manager4567|type:p2p')).toBe('dm-manager4567');
+    expect(fs.existsSync(store)).toBe(false);
+  });
+
+  test('zhang@abc gets a stable dm-_<n>, persisted 0600', () => {
+    const a = sg('zhang@abc|type:p2p|msg:1');
+    expect(a).toMatch(/^dm-_\d+$/);
+    expect(isValidSessionGroup(a)).toBe(true);
+    expect(sg('zhang@abc|type:p2p|msg:2')).toBe(a);
+    expect(sg('zhang@abc')).toBe(a);
+    expect(fs.statSync(store).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(fs.readFileSync(`${store}.bak`, 'utf8')).ids['zhang@abc']).toBe(a);
+  });
+
+  test.each(['张三', 'a b', '_1', 'a+b', 'x'.repeat(100)])('non-compliant %s maps to a short id', (id) => {
+    expect(sg(`${id}|type:p2p`)).toMatch(/^dm-_\d+$/);
+  });
+
+  test('different bad ids get different groups; numbers never reused after store loss', () => {
+    const a = sg('zhang@abc|type:p2p', () => 5);
+    const b = sg('李四|type:p2p', () => 5);
+    expect(a).not.toBe(b);
+    fs.rmSync(store); fs.rmSync(`${store}.bak`);
+    const c = sg('wang@abc|type:p2p');
+    expect([a, b]).not.toContain(c);
+  });
+
+  test('a missing store is restored from .bak', () => {
+    const a = sg('zhang@abc|type:p2p');
+    fs.rmSync(store);
+    expect(sg('zhang@abc|type:p2p')).toBe(a);
+  });
+
+  test('corrupt or invalid store errors and is left untouched', () => {
+    fs.writeFileSync(store, '{not json');
+    expect(() => sg('zhang@abc|type:p2p')).toThrow(/not valid JSON/);
+    expect(fs.readFileSync(store, 'utf8')).toBe('{not json');
+    fs.writeFileSync(store, JSON.stringify({ ids: { x: 'dm-x' }, next: 1 }));
+    expect(() => sg('zhang@abc|type:p2p')).toThrow(/invalid/);
+    // compliant ids never touch the store
+    expect(sg('ok1|type:p2p')).toBe('dm-ok1');
+  });
+
+  test('inbound and scripts/session-group.js agree (same store)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-home-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      const cli = (ep) => execFileSync(process.execPath, ['scripts/session-group.js', ep], { encoding: 'utf8', env }).trim();
+      const first = cli('zhang@abc|type:p2p|msg:1');
+      expect(first).toMatch(/^dm-_\d+$/);
+      const realStore = path.join(home, 'zylos/components/dingtalk/session-groups.json');
+      expect(sessionGroupFromEndpoint('zhang@abc|type:p2p|msg:2', { storePath: realStore })).toBe(first);
+      expect(cli('zhang@abc|type:p2p')).toBe(first);
+      expect(cli('other@abc|type:p2p')).not.toBe(first);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('buildC4ReceiveArgs', () => {
+  let dir;
+  const prev = process.env.ZYLOS_DIR;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-c4-'));
+    fs.mkdirSync(path.join(dir, '.claude/skills/comm-bridge/scripts'), { recursive: true });
+    process.env.ZYLOS_DIR = dir;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = prev;
+  });
+  const manifest = (options) => fs.writeFileSync(
+    path.join(dir, '.claude/skills/comm-bridge/scripts/c4-receive-options.json'), JSON.stringify({ options }));
+  const base = ['--channel', 'dingtalk', '--endpoint', 'e', '--json', '--content', 'c'];
+
+  test('old Core without manifest: args unchanged', () => {
+    expect(buildC4ReceiveArgs({ channel: 'dingtalk', endpoint: 'e', content: 'c', sessionGroup: 'dm-1' })).toEqual(base);
+  });
+
+  test('manifest without --session-group: args unchanged', () => {
+    manifest({ '--channel': {} });
+    expect(buildC4ReceiveArgs({ channel: 'dingtalk', endpoint: 'e', content: 'c', sessionGroup: 'dm-1' })).toEqual(base);
+  });
+
+  test('manifest with --session-group: group passed', () => {
+    manifest({ '--session-group': { takesValue: true } });
+    expect(buildC4ReceiveArgs({ channel: 'dingtalk', endpoint: 'e', content: 'c', sessionGroup: 'dm-1' }))
+      .toEqual([...base, '--session-group', 'dm-1']);
+  });
+});
+
+describe('sendToC4 rejection handling', () => {
+  const reject = (persisted) => ({ ok: false, error: { code: 'X', message: 'core text', persisted } });
+  const run = (responses) => new Promise((resolve) => {
+    const notices = [];
+    let calls = 0;
+    const exec = (_bin, _args, _opts, cb) => {
+      const r = responses[calls++];
+      cb(r === 'ok' ? null : new Error('fail'), r === 'ok' ? '' : JSON.stringify(r ?? ''));
+    };
+    sendToC4('dingtalk', 'u1|type:p2p|msg:m', 'hi', (n) => notices.push(n),
+      { exec, retryDelayMs: 1, onDone: (outcome) => resolve({ outcome, notices, calls }) });
+  });
+
+  test('classifies persisted', () => {
+    expect(classifyC4Rejection(reject(['row']))).toBe('committed');
+    expect(classifyC4Rejection(reject([]))).toBe('not_stored');
+    expect(classifyC4Rejection(reject(undefined))).toBe('uncertain');
+  });
+
+  test('success sends no notice', async () => {
+    expect(await run(['ok'])).toEqual({ outcome: 'sent', notices: [], calls: 1 });
+  });
+
+  test('committed: no notice text, no resend', async () => {
+    expect(await run([reject(['row'])])).toEqual({ outcome: 'committed', notices: [null], calls: 1 });
+  });
+
+  test('not stored: generic notice, no resend', async () => {
+    expect(await run([reject([])])).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: 1 });
+  });
+
+  const runRaw = (results) => new Promise((resolve) => {
+    const notices = [];
+    let calls = 0;
+    const exec = (_bin, _args, _opts, cb) => { const [err, out] = results[calls++]; cb(err, out); };
+    sendToC4('dingtalk', 'u1|type:p2p|msg:m', 'hi', (n) => notices.push(n),
+      { exec, retryDelayMs: 1, onDone: (outcome) => resolve({ outcome, notices, calls }) });
+  });
+  const spawnError = () => Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT', syscall: 'spawn /x/node' });
+  const killed = () => Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGKILL', code: null });
+
+  test('ran but failed without structured result: uncertain notice, never resent', async () => {
+    expect(await run([null, null])).toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 1 });
+  });
+
+  test('SIGKILL after printing ok:true: treated as delivered, no resend, no notice', async () => {
+    expect(await runRaw([[killed(), '{"ok":true,"action":"queued","id":1}']]))
+      .toEqual({ outcome: 'sent', notices: [], calls: 1 });
+  });
+
+  test('SIGKILL with no output: uncertain, no resend', async () => {
+    expect(await runRaw([[killed(), '']])).toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 1 });
+  });
+
+  test('spawn failure: retried once, then sent', async () => {
+    expect(await runRaw([[spawnError(), ''], [null, '']])).toEqual({ outcome: 'sent', notices: [], calls: 2 });
+  });
+
+  test('spawn failure twice: generic notice (nothing stored)', async () => {
+    expect(await runRaw([[spawnError(), ''], [spawnError(), '']]))
+      .toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: 2 });
+  });
+
+  test('spawn failure then uncertain run: uncertain, no third call', async () => {
+    expect(await runRaw([[spawnError(), ''], [killed(), '']]))
+      .toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 2 });
+  });
+});
+
+describe('sendToC4 session group resolution', () => {
+  let dir;
+  const prev = process.env.ZYLOS_DIR;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-c4-'));
+    fs.mkdirSync(path.join(dir, '.claude/skills/comm-bridge/scripts'), { recursive: true });
+    process.env.ZYLOS_DIR = dir;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = prev;
+  });
+  const supportGroups = () => fs.writeFileSync(
+    path.join(dir, '.claude/skills/comm-bridge/scripts/c4-receive-options.json'),
+    JSON.stringify({ options: { '--session-group': { takesValue: true } } }));
+  const send = (endpoint) => new Promise((resolve) => {
+    const notices = [];
+    const calls = [];
+    const exec = (_bin, args, _opts, cb) => { calls.push(args); cb(null, ''); };
+    sendToC4('dingtalk', endpoint, 'hi', (n) => notices.push(n),
+      { exec, retryDelayMs: 1, groupStorePath: path.join(dir, 'session-groups.json'), onDone: (outcome) => resolve({ outcome, notices, calls }) });
+  });
+
+  test('new Core: invalid endpoint is never sent to the overall group', async () => {
+    supportGroups();
+    expect(await send('cid-x|type:group')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+  });
+
+  test('new Core: user@corp staffId is delivered with a stable short group', async () => {
+    supportGroups();
+    const first = await send('user@corp|type:p2p|msg:m');
+    expect(first.outcome).toBe('sent');
+    const g = first.calls[0][first.calls[0].indexOf('--session-group') + 1];
+    expect(g).toMatch(/^dm-_\d+$/);
+    const again = await send('user@corp|type:p2p|msg:n');
+    expect(again.calls[0][again.calls[0].indexOf('--session-group') + 1]).toBe(g);
+  });
+
+  test('new Core: corrupt short-id store rejects instead of resetting', async () => {
+    supportGroups();
+    fs.writeFileSync(path.join(dir, 'session-groups.json'), 'garbage');
+    expect(await send('user@corp|type:p2p|msg:m')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+    expect(await send('u1|type:p2p|msg:m')).toMatchObject({ outcome: 'sent' });
+  });
+
+  test('new Core: valid endpoint carries --session-group', async () => {
+    supportGroups();
+    const { outcome, calls } = await send('u1|type:p2p|msg:m');
+    expect(outcome).toBe('sent');
+    expect(calls[0]).toContain('--session-group');
+  });
+
+  test('old Core: user@corp staffId is delivered without a session group (0.2.0 behaviour)', async () => {
+    const { outcome, notices, calls } = await send('user@corp|type:p2p|msg:m');
+    expect(outcome).toBe('sent');
+    expect(notices).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).not.toContain('--session-group');
+    expect(calls[0]).toContain('user@corp|type:p2p|msg:m');
+  });
+});

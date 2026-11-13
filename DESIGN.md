@@ -74,6 +74,22 @@ index.js exposes an HTTP server on 127.0.0.1:4460 for:
 5. Try sessionWebhook first, fall back to REST API
 6. Record outgoing to history via internal API
 
+### Outbound Policy
+
+`send.js` applies the inbound access rules to the destination
+(`src/lib/outbound.js`): DMs only to staffIds that pass `checkDMPermission`;
+groups only when enabled. An owner reply in a non-enabled group is allowed by
+proof: the component stores the sender with each accepted message's
+sessionWebhook and `/internal/get-webhook` returns it. Expired or missing
+records deny the reply, never allow it. DingTalk has no API to look up a
+message's author, which is why the proof is component-held.
+
+### Session Groups
+
+Inbound messages carry `--session-group` (`dm-<staffId>` /
+`group-<conversationId>`, base64 `+`/`/`/`=` mapped to `-`/`_`/`.`) when Core advertises the option in
+`c4-receive-options.json` (`src/lib/c4.js`, `src/lib/session-group.js`).
+
 ## Configuration
 
 | Location | Content |

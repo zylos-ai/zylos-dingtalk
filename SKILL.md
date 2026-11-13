@@ -1,6 +1,6 @@
 ---
 name: dingtalk
-version: 0.2.0
+version: 0.3.0
 description: >
   DingTalk (钉钉) communication channel. Receives messages via Stream mode
   (WebSocket) and sends messages via DingTalk REST API. Use when:
@@ -73,6 +73,52 @@ Connects DingTalk (钉钉) to the Zylos agent via C4 Communication Bridge.
 - Private IP detection for DingTalk gateway endpoint
 - Log sanitization (no user content in logs)
 
+## Session Groups (multi-session Core)
+
+With a zylos-core that supports multi-session, each inbound message carries a
+session group, so every DingTalk conversation gets its own conversation thread.
+Replies still go through the same `reply via` path.
+
+| Conversation | Session group | Example |
+|---|---|---|
+| 1:1 chat | `dm-<staffId>` | `dm-manager4567` |
+| Group | `group-<conversationId>` | `group-cidAbC-dE_f12..` |
+
+- Conversation ids are base64; `+` becomes `-`, `/` becomes `_`, `=` becomes
+  `.` (reversible, so names stay one-to-one) to make the name valid for Core.
+- A staffId outside Core's alphabet (e.g. `zhang@abc`, Chinese, spaces, or not
+  starting with a letter/digit) is never rejected: it gets a local short id
+  such as `dm-_1794548699297`, assigned once and kept in
+  `~/zylos/components/dingtalk/session-groups.json` (plus `.bak`). Inbound and
+  `session-group.js` use the same store, so the name is stable. Do not edit or
+  delete that file; if it is corrupt, those users' messages are refused until
+  it is fixed (it is never reset, so names are never reused).
+- The group is passed only if the installed Core lists `--session-group` in
+  `c4-receive-options.json`; older Cores behave exactly as before.
+
+```bash
+node ~/zylos/.claude/skills/dingtalk/scripts/session-group.js "<endpoint>"
+```
+
+## Outbound Policy
+
+`send.js` checks the destination before sending (and again for queued
+retries). Whether a destination is a DM or a group comes from the component's
+own records of DingTalk callbacks, not from the endpoint's `type`: a
+destination that has never sent the bot a message is treated as a group, and
+an endpoint whose `type` disagrees with the recorded type is blocked.
+Use the endpoint from the incoming message.
+- **DM:** only to the owner or users the DM policy allows (`dmPolicy` /
+  `dmAllowFrom`).
+- **Group:** only enabled groups (`groupPolicy: open`, or listed under
+  `groups`). In a group that is not enabled, only a reply to a message the
+  owner sent there is allowed (the component keeps that proof for 7 days,
+  across restarts). If such a reply is blocked, send it to the owner's DM
+  instead.
+- `groupPolicy: disabled` blocks every group send, owner replies included
+  (inbound rejects the owner too, same as Telegram).
+- Blocked sends exit 1 with `outbound blocked` and are not queued.
+
 ## Admin CLI
 ```bash
 node ~/zylos/.claude/skills/dingtalk/src/admin.js help
@@ -101,13 +147,14 @@ exactly:
 3. Check `groupPolicy` (shown by `list-groups`). If it is `open`, every
    member's messages reach the Agent, so the sender cannot be verified as the
    owner: refuse group-admin changes in the group and ask the owner to do it
-   in a private chat. Only when `groupPolicy` is `allowlist` or `disabled`
-   **and** the group is not listed is the group not enabled; there only the
-   owner's messages reach the Agent (owner bypass), so honor it: run
+   in a private chat. Only when `groupPolicy` is `allowlist` **and** the
+   group is not listed is the group not enabled; there only the owner's
+   messages reach the Agent (owner bypass), so honor it: run
    `admin.js add-group <conversationId> "<group name>"` — the conversationId is the first segment of the group reply endpoint
    (`<conversationId>|type:group|msg:...`), the name comes from
-   `[DingTalk GROUP:<name>]`. If `groupPolicy` is `disabled`, also run
-   `admin.js set-group-policy allowlist`.
+   `[DingTalk GROUP:<name>]`. With `groupPolicy: disabled` no group message
+   reaches the Agent, the owner's included; the owner has to ask in a private
+   chat, then run `admin.js set-group-policy allowlist` and `add-group`.
 4. In an already-enabled group, refuse every other group-admin change
    (allowFrom, remove-group, policy) and ask the owner to do it in a private
    chat.

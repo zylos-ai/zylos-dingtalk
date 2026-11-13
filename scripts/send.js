@@ -20,6 +20,10 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { withRetry, isRetryable, MAX_RETRIES } from '../src/lib/retry.js';
+import { getConfig } from '../src/lib/config.js';
+import { checkOutbound } from '../src/lib/outbound.js';
+import { readStore } from '../src/lib/conversations.js';
+import { parseEndpoint } from '../src/lib/session-group.js';
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
@@ -37,19 +41,6 @@ const message = msgParts.join(' ');
 if (!endpoint || !message) {
   console.error('Usage: send.js <endpoint> <message>');
   process.exit(1);
-}
-
-// --- Parse endpoint ---
-function parseEndpoint(ep) {
-  const parts = ep.split('|');
-  const result = { id: parts[0] };
-  for (const part of parts.slice(1)) {
-    const idx = part.indexOf(':');
-    if (idx > 0) {
-      result[part.slice(0, idx)] = part.slice(idx + 1);
-    }
-  }
-  return result;
 }
 
 // --- Internal API helpers ---
@@ -77,7 +68,14 @@ async function internalRequest(urlPath, data) {
 
 async function getSessionWebhook(ep) {
   const result = await internalRequest('/internal/get-webhook', { endpoint: ep });
-  return result?.ok ? result.url : null;
+  return result?.ok ? result.url || null : null;
+}
+
+const CONVERSATIONS_FILE = path.join(DATA_DIR, 'conversations.json');
+
+/** Policy check against live config and the component's inbound records. */
+function outboundCheck(endpointStr) {
+  return checkOutbound(getConfig(), parseEndpoint(endpointStr), readStore(CONVERSATIONS_FILE));
 }
 
 async function recordOutgoing(chatId, text) {
@@ -227,6 +225,13 @@ async function drainQueue() {
       continue;
     }
     const ep = parseEndpoint(item.endpoint);
+    // Check each item before merging: a merged batch is sent with its first
+    // item's endpoint, so one blocked item must not decide for the others.
+    const { reason } = outboundCheck(item.endpoint);
+    if (reason) {
+      console.error(`[dingtalk] Queue: dropped message to ${ep.id}: outbound blocked: ${reason}`);
+      continue;
+    }
     const key = `${ep.id}|${ep.type || 'p2p'}`;
     if (!groups.has(key)) groups.set(key, { items: [], endpoint: item.endpoint });
     groups.get(key).items.push(item);
@@ -604,6 +609,11 @@ async function sendMedia(ep, type, filePath) {
 async function sendMessage(endpointStr, msg) {
   const ep = parseEndpoint(endpointStr);
   const isGroup = ep.type === 'group';
+
+  // Checked on every attempt, including queued retries, against live config.
+  // Routing below uses ep.type, which the check requires to equal the real type.
+  const { reason } = outboundCheck(endpointStr);
+  if (reason) throw new Error(`outbound blocked: ${reason}`);
 
   // Check for media
   const mediaMatch = msg.match(/^\[MEDIA:(\w+)\](.+)$/);
