@@ -54,6 +54,16 @@ export function classifyC4Rejection(response) {
   return persisted.length > 0 ? 'committed' : 'not_stored';
 }
 
+/**
+ * True when c4-receive never started (spawn itself failed), so Core cannot
+ * have stored anything. Any other failure without a structured result has an
+ * unknown commit state and is never retried (Core c4-receive contract).
+ */
+export function neverStarted(error) {
+  return typeof error?.code === 'string'
+    && typeof error.syscall === 'string' && error.syscall.startsWith('spawn');
+}
+
 export function parseC4Response(stdout) {
   if (!stdout) return null;
   try {
@@ -69,8 +79,9 @@ export function parseC4Response(stdout) {
  * installed Core lists --session-group (rechecked on every call, including the
  * retry). A rejected group is never dropped and resent to the overall group,
  * and Core's error text (written for the agent) only goes to the log.
- * No component-side timeout kills c4-receive: killing it after Core stored the
- * row and retrying would deliver the message twice.
+ * No component-side timeout kills c4-receive. Only a call that never started
+ * (spawn failure) is retried once; a structured `ok:false` follows
+ * error.persisted; any other failure is uncertain and never resent.
  * @param {string} channel
  * @param {string} endpoint
  * @param {string} content
@@ -116,21 +127,38 @@ export function sendToC4(channel, endpoint, content, onReject, { retryDelayMs = 
     return done('rejected');
   };
 
-  run((error, stdout) => {
-    if (!error) return done('sent');
+  const handleUnknown = (error, label) => {
+    // c4-receive ran: Core may have stored the message. Never resend.
+    console.error(`[dingtalk] C4 ${label}, outcome unknown, not resending [group=${sessionGroup}]: ${error.message}`);
+    onReject?.(UNCERTAIN_REPLY);
+    return done('failed');
+  };
+
+  const handleResult = (error, stdout, label) => {
     const response = parseC4Response(stdout);
-    if (response?.ok === false && response.error?.message) return handleRejection(response, 'rejected');
-    console.warn(`[dingtalk] C4 send failed, retrying in ${retryDelayMs}ms: ${error.message}`);
+    if (!error || response?.ok === true) {
+      if (error) console.warn(`[dingtalk] c4-receive reported ok but exited with an error, treating as delivered: ${error.message}`);
+      return done('sent');
+    }
+    if (response?.ok === false && response.error?.message) return handleRejection(response, label);
+    return null;
+  };
+
+  run((error, stdout) => {
+    const handled = handleResult(error, stdout, 'rejected');
+    if (handled !== null) return handled;
+    if (!neverStarted(error)) return handleUnknown(error, 'send failed');
+    console.warn(`[dingtalk] c4-receive did not start, retrying in ${retryDelayMs}ms: ${error.message}`);
     setTimeout(() => {
       run((retryError, retryStdout) => {
-        if (!retryError) return done('sent');
-        const retryResponse = parseC4Response(retryStdout);
-        if (retryResponse?.ok === false && retryResponse.error?.message) {
-          return handleRejection(retryResponse, 'rejected after retry');
+        const retried = handleResult(retryError, retryStdout, 'rejected after retry');
+        if (retried !== null) return retried;
+        if (neverStarted(retryError)) {
+          console.error(`[dingtalk] c4-receive did not start after retry: ${retryError.message}`);
+          onReject?.(GENERIC_REJECT_REPLY);
+          return done('rejected');
         }
-        console.error(`[dingtalk] C4 send failed after retry: ${retryError.message}`);
-        onReject?.(UNCERTAIN_REPLY);
-        return done('failed');
+        return handleUnknown(retryError, 'send failed after retry');
       });
     }, retryDelayMs);
   });

@@ -1,38 +1,70 @@
 /**
  * Outbound destination policy for scripts/send.js.
  *
- * A DM (`type:p2p`, or no type) may only go to a staffId the inbound DM policy
- * accepts (owner always; then dmPolicy / dmAllowFrom). A group (`type:group`)
- * must pass the group policy (open, or listed under `groups` for allowlist);
- * otherwise only a reply to an accepted inbound message written by the owner
- * is allowed, so owner conversations in non-enabled groups keep working.
- * groupPolicy=disabled blocks every group send, owner replies included. The proof is the sender recorded with
- * that message's sessionWebhook by the running component; once the webhook
- * expires or the component restarts, such a reply is denied, never wrongly
- * allowed.
+ * DM vs group comes from the conversation type the component recorded from
+ * DingTalk callbacks (src/lib/conversations.js), never from the `type` the
+ * agent wrote into the endpoint. Unknown ids are treated as groups (the
+ * strictest case); the bound owner's staffId counts as a known 1:1 chat
+ * (it was bound from a DM callback), and ids listed under `groups` (admin
+ * config) count as known groups. When the endpoint's declared type disagrees
+ * with the real type the send is blocked, so routing never follows a forged type.
+ *
+ * - DM: only staffIds the inbound DM policy accepts (owner always).
+ * - Group: groupPolicy=open, or listed under `groups` for allowlist; otherwise
+ *   only a reply to an accepted inbound group message written by the owner
+ *   (proof: the component's persisted inbound record for conversationId+msgId).
+ *   groupPolicy=disabled blocks every group send, owner replies included.
  *
  * Kept free of side effects so it can be unit tested.
  */
 import { checkDMPermission, isOwner } from './access.js';
+import { lookupConversationType, lookupInbound } from './conversations.js';
+
+/**
+ * Real conversation type of an endpoint id, from component-held records.
+ * @returns {'p2p'|'group'|null} null = unknown
+ */
+export function realConversationType(config, store, id) {
+  const recorded = lookupConversationType(store, id);
+  if (recorded) return recorded;
+  if (config.owner?.bound && config.owner.staff_id && String(config.owner.staff_id) === id) return 'p2p';
+  if (Object.hasOwn(config.groups || {}, id)) return 'group';
+  return null;
+}
 
 /**
  * @param {object} config
- * @param {{id: string, type?: string}} ep - parsed endpoint
- * @param {{senderStaffId?: string}|null} [inbound] - sender recorded for the
- *   endpoint's inbound message, or null when unknown
- * @returns {string|null} denial reason, or null when allowed
+ * @param {{id: string, type?: string, msg?: string}} ep - parsed endpoint
+ * @param {object} [store] - conversations store (readStore result)
+ * @returns {{reason: string|null, type: 'p2p'|'group'}} denial reason (null =
+ *   allowed) and the real type to route by
  */
-export function outboundDenialReason(config, ep, inbound = null) {
-  if (!ep?.id) return 'missing destination id';
-  if (ep.type === 'group') {
-    if (config.groupPolicy === 'open') return null;
-    if (config.groupPolicy === 'allowlist' && Object.hasOwn(config.groups || {}, ep.id)) return null;
-    if (config.groupPolicy === 'disabled') return 'groupPolicy=disabled';
-    if (inbound?.senderStaffId && isOwner(config, inbound.senderStaffId)) return null;
-    return `group ${ep.id} is not enabled (groupPolicy=${config.groupPolicy}) and the message is not a reply to the owner`;
+export function checkOutbound(config, ep, store = null, now = Date.now()) {
+  if (!ep?.id) return { reason: 'missing destination id', type: 'group' };
+  const known = realConversationType(config, store, ep.id);
+  const type = known || 'group';
+  const declared = ep.type === 'group' ? 'group' : 'p2p'; // no type = DM (legacy endpoint format)
+  if (declared !== type) {
+    return {
+      reason: known
+        ? `endpoint type ${declared} does not match the recorded conversation type ${known} for ${ep.id}`
+        : `unknown conversation ${ep.id}: no inbound message recorded, treated as a group`,
+      type,
+    };
+  }
+  if (type === 'group') {
+    if (config.groupPolicy === 'disabled') return { reason: 'groupPolicy=disabled', type };
+    if (config.groupPolicy === 'open') return { reason: null, type };
+    if (config.groupPolicy === 'allowlist' && Object.hasOwn(config.groups || {}, ep.id)) return { reason: null, type };
+    const inbound = lookupInbound(store, ep.id, ep.msg, now);
+    if (inbound && isOwner(config, inbound.senderStaffId)) return { reason: null, type };
+    return {
+      reason: `group ${ep.id} is not enabled (groupPolicy=${config.groupPolicy}) and the message is not a reply to the owner`,
+      type,
+    };
   }
   if (!checkDMPermission(config, ep.id)) {
-    return `DM recipient ${ep.id} is not allowed by dmPolicy=${config.dmPolicy}`;
+    return { reason: `DM recipient ${ep.id} is not allowed by dmPolicy=${config.dmPolicy}`, type };
   }
-  return null;
+  return { reason: null, type };
 }

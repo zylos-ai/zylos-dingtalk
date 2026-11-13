@@ -43,6 +43,20 @@ describe('sessionGroupFromEndpoint', () => {
     expect(new Set(names).size).toBe(ids.length);
   });
 
+  test('rejects non-base64 group ids instead of relying on the alphabet', () => {
+    expect(() => sessionGroupFromEndpoint('cid-A|type:group')).toThrow(/not base64/);
+    expect(() => sessionGroupFromEndpoint('cid_A|type:group')).toThrow(/not base64/);
+    expect(() => sessionGroupFromEndpoint('cid.A|type:group')).toThrow(/not base64/);
+  });
+
+  test('staffIds are not rewritten: + / = are rejected, so a+b and a-b cannot collide', () => {
+    expect(() => sessionGroupFromEndpoint('a+b|type:p2p')).toThrow(/staffId/);
+    expect(() => sessionGroupFromEndpoint('a/b|type:p2p')).toThrow(/staffId/);
+    expect(() => sessionGroupFromEndpoint('a=b|type:p2p')).toThrow(/staffId/);
+    expect(sessionGroupFromEndpoint('a-b|type:p2p')).toBe('dm-a-b');
+    expect(sessionGroupFromEndpoint('a_b.c:d|type:p2p')).toBe('dm-a_b.c:d');
+  });
+
   test('rejects empty, invalid or overlong ids', () => {
     expect(() => sessionGroupFromEndpoint('')).toThrow();
     expect(() => sessionGroupFromEndpoint('a b|type:p2p')).toThrow();
@@ -70,6 +84,7 @@ describe('buildC4ReceiveArgs', () => {
     process.env.ZYLOS_DIR = dir;
   });
   afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
     if (prev === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = prev;
   });
   const manifest = (options) => fs.writeFileSync(
@@ -123,8 +138,41 @@ describe('sendToC4 rejection handling', () => {
     expect(await run([reject([])])).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: 1 });
   });
 
-  test('unstructured failure twice: retried once, uncertain notice', async () => {
-    expect(await run([null, null])).toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 2 });
+  const runRaw = (results) => new Promise((resolve) => {
+    const notices = [];
+    let calls = 0;
+    const exec = (_bin, _args, _opts, cb) => { const [err, out] = results[calls++]; cb(err, out); };
+    sendToC4('dingtalk', 'u1|type:p2p|msg:m', 'hi', (n) => notices.push(n),
+      { exec, retryDelayMs: 1, onDone: (outcome) => resolve({ outcome, notices, calls }) });
+  });
+  const spawnError = () => Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT', syscall: 'spawn /x/node' });
+  const killed = () => Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGKILL', code: null });
+
+  test('ran but failed without structured result: uncertain notice, never resent', async () => {
+    expect(await run([null, null])).toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 1 });
+  });
+
+  test('SIGKILL after printing ok:true: treated as delivered, no resend, no notice', async () => {
+    expect(await runRaw([[killed(), '{"ok":true,"action":"queued","id":1}']]))
+      .toEqual({ outcome: 'sent', notices: [], calls: 1 });
+  });
+
+  test('SIGKILL with no output: uncertain, no resend', async () => {
+    expect(await runRaw([[killed(), '']])).toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 1 });
+  });
+
+  test('spawn failure: retried once, then sent', async () => {
+    expect(await runRaw([[spawnError(), ''], [null, '']])).toEqual({ outcome: 'sent', notices: [], calls: 2 });
+  });
+
+  test('spawn failure twice: generic notice (nothing stored)', async () => {
+    expect(await runRaw([[spawnError(), ''], [spawnError(), '']]))
+      .toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: 2 });
+  });
+
+  test('spawn failure then uncertain run: uncertain, no third call', async () => {
+    expect(await runRaw([[spawnError(), ''], [killed(), '']]))
+      .toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 2 });
   });
 
   test('invalid endpoint is never sent to the overall group', async () => {

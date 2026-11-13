@@ -8,17 +8,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Session groups for multi-session zylos-core: DMs are `dm-<staffId>`, groups
-  `group-<conversationId>` (base64 `+`/`/`/`=` mapped reversibly to
-  `-`/`_`/`.`, since Core only accepts `[A-Za-z0-9_.:-]`). `--session-group` is
+  `group-<conversationId>` (base64 `+`/`/`/`=` mapped to `-`/`_`/`.`, since
+  Core only accepts `[A-Za-z0-9_.:-]`). Ids that do not conform (non-base64
+  conversation ids, staffIds with characters outside Core's alphabet) are
+  rejected rather than mapped, so the mapping is one-to-one for any input. `--session-group` is
   passed only when the installed Core lists it in `c4-receive-options.json`,
   so older Cores see unchanged args.
 - `scripts/session-group.js <endpoint>` prints the group for an endpoint.
 - Outbound destination policy in `send.js`, checked on every attempt
-  (including queued retries): DMs only to staffIds the inbound DM policy
+  (including queued retries, item by item before merging). DM vs group comes
+  from the conversation type the component recorded from DingTalk callbacks
+  (`conversations.json` in the data dir), never from the endpoint's `type`;
+  unknown ids are treated as groups, and a declared type that disagrees with
+  the recorded one is blocked. DMs only to staffIds the inbound DM policy
   accepts (owner always); groups only when enabled (`open`, or listed for
   `allowlist`), otherwise only a reply to an accepted owner message, proven by
-  the sender the component recorded with that message's sessionWebhook.
-  Blocked sends exit 1 with `outbound blocked` and are not queued.
+  the persisted inbound record (conversationId + msgId + sender, kept 7 days,
+  survives webhook expiry and restarts). Blocked sends exit 1 with
+  `outbound blocked` and are not queued.
 
 ### Changed
 - `groupPolicy: disabled` now rejects the owner too, inbound and outbound
@@ -28,7 +35,11 @@ All notable changes to this project will be documented in this file.
   unknown -> 「抱歉，这条消息可能没有送达……」. Core's raw error text only goes
   to the log. A rejected group is never resent to the overall group.
 - No 30s timeout on c4-receive: killing it after Core stored the row and
-  retrying would deliver the message twice. Unstructured failures retry once.
+  retrying would deliver the message twice. Only a c4-receive that never
+  started (spawn failure) is retried once; a run that fails without a
+  structured `ok:false` (crash, SIGKILL, ...) is treated as uncertain and never
+  resent (Core contract), and `ok:true` on stdout counts as delivered even if
+  the process then exits non-zero.
 
 ## [0.2.0] - 2026-11-04
 

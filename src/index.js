@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
 import { sendToC4 } from './lib/c4.js';
+import { recordInbound, conversationTypeFromCallback } from './lib/conversations.js';
 import { getUserInfo } from './lib/contact.js';
 import {
   addThinkingEmoji,
@@ -47,6 +48,7 @@ const DEFAULT_HISTORY_LIMIT = 5;
 // User name cache: staffId -> { name, cachedAt }
 const userNameCache = new Map();
 const USER_CACHE_TTL = 10 * 60 * 1000;
+const CONVERSATIONS_PATH = path.join(DATA_DIR, 'conversations.json');
 const USER_CACHE_PATH = path.join(DATA_DIR, 'user-cache.json');
 
 // --- Init ---
@@ -212,6 +214,11 @@ async function handleBotMessage(res) {
   // conversationType: "1" = 1:1 DM, "2" = group
   const isGroup = conversationType === '2';
   const isDM = !isGroup;
+  const realType = conversationTypeFromCallback(conversationType);
+  const conversationKey = isGroup ? conversationId : senderStaffId;
+  // Record the real conversation type: outbound policy relies on it, never
+  // on the type the agent writes into an endpoint.
+  safeRecordInbound({ id: conversationKey, type: realType });
   let userName = senderNick || String(senderStaffId || 'Unknown');
 
   // ACK as early as possible to avoid DingTalk 60s redelivery.
@@ -327,7 +334,10 @@ async function handleBotMessage(res) {
       : `${senderStaffId}|type:p2p|msg:${msgId}`;
 
     // Store sessionWebhook in a temp map so send.js can use it
-    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime, senderStaffId);
+    storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
+    // Persisted proof of who wrote this accepted message (owner-reply exception
+    // in non-enabled groups); survives webhook expiry and restarts.
+    safeRecordInbound({ id: conversationKey, type: realType, msgId, senderStaffId, accepted: true });
 
     let c4Content = '';
 
@@ -378,9 +388,17 @@ async function handleBotMessage(res) {
 const sessionWebhooks = new Map();
 const WEBHOOK_CLEANUP_INTERVAL = 60000;
 
-function storeSessionWebhook(endpoint, webhookUrl, expiresAt, senderStaffId) {
+function storeSessionWebhook(endpoint, webhookUrl, expiresAt) {
   if (!webhookUrl) return;
-  sessionWebhooks.set(endpoint, { url: webhookUrl, expiresAt, senderStaffId: String(senderStaffId ?? '') });
+  sessionWebhooks.set(endpoint, { url: webhookUrl, expiresAt });
+}
+
+function safeRecordInbound(rec) {
+  try {
+    recordInbound(CONVERSATIONS_PATH, rec);
+  } catch (err) {
+    console.error(`[dingtalk] Failed to record conversation: ${err.message}`);
+  }
 }
 
 // Clean up expired webhooks
@@ -428,9 +446,7 @@ function startInternalServer(port) {
           const wh = sessionWebhooks.get(endpoint);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           if (wh && Date.now() < wh.expiresAt) {
-            // senderStaffId: who wrote the accepted inbound message; send.js
-            // uses it to allow owner replies to non-allowlisted groups.
-            res.end(JSON.stringify({ ok: true, url: wh.url, senderStaffId: wh.senderStaffId }));
+            res.end(JSON.stringify({ ok: true, url: wh.url }));
           } else {
             res.end(JSON.stringify({ ok: false }));
           }

@@ -96,13 +96,18 @@ node ~/zylos/.claude/skills/dingtalk/scripts/session-group.js "<endpoint>"
 ## Outbound Policy
 
 `send.js` checks the destination before sending (and again for queued
-retries):
+retries). Whether a destination is a DM or a group comes from the component's
+own records of DingTalk callbacks, not from the endpoint's `type`: a
+destination that has never sent the bot a message is treated as a group, and
+an endpoint whose `type` disagrees with the recorded type is blocked.
+Use the endpoint from the incoming message.
 - **DM:** only to the owner or users the DM policy allows (`dmPolicy` /
   `dmAllowFrom`).
 - **Group:** only enabled groups (`groupPolicy: open`, or listed under
   `groups`). In a group that is not enabled, only a reply to a message the
-  owner sent there is allowed, while its reply link is
-  still valid (about 1-2 hours, lost on component restart).
+  owner sent there is allowed (the component keeps that proof for 7 days,
+  across restarts). If such a reply is blocked, send it to the owner's DM
+  instead.
 - `groupPolicy: disabled` blocks every group send, owner replies included
   (inbound rejects the owner too, same as Telegram).
 - Blocked sends exit 1 with `outbound blocked` and are not queued.

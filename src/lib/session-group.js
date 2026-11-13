@@ -6,9 +6,10 @@
  * agree. Rules (fixed once live; changing them needs a migration):
  *   1:1 chat  `<staffId>|type:p2p|...`        -> dm-<staffId>
  *   group     `<conversationId>|type:group|...` -> group-<conversationId>
- * Core only accepts [A-Za-z0-9_.:-], so the id is mapped reversibly:
- * `+` -> `-`, `/` -> `_`, `=` -> `.`. DingTalk conversation ids are base64
- * (no `-`, `_` or `.`), so the mapping stays one-to-one.
+ * Core only accepts [A-Za-z0-9_.:-]. Conversation ids must be base64
+ * ([A-Za-z0-9+/=]) and are mapped `+` -> `-`, `/` -> `_`, `=` -> `.`;
+ * staffIds must already be in Core's alphabet and are not rewritten.
+ * Non-conforming ids are rejected (never sent), keeping the mapping one-to-one.
  * The component never adds a namespace; Core does.
  */
 
@@ -36,8 +37,22 @@ export function parseEndpoint(ep) {
   return result;
 }
 
-function safeId(id) {
-  return String(id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '.');
+const BASE64_ID = /^[A-Za-z0-9+/=]+$/;
+const PLAIN_ID = /^[A-Za-z0-9_.:-]+$/;
+
+/**
+ * Group conversation ids must be base64 and are mapped `+`->`-`, `/`->`_`,
+ * `=`->`.`; staffIds are used as-is and must already be in Core's alphabet.
+ * Anything else is rejected, so the mapping stays one-to-one for any input.
+ */
+function safeId(id, isGroup) {
+  id = String(id);
+  if (isGroup) {
+    if (!BASE64_ID.test(id)) throw new Error(`conversation id is not base64: ${JSON.stringify(id.slice(0, 64))}`);
+    return id.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '.');
+  }
+  if (!PLAIN_ID.test(id)) throw new Error(`staffId has characters outside [A-Za-z0-9_.:-]: ${JSON.stringify(id.slice(0, 64))}`);
+  return id;
 }
 
 /**
@@ -48,7 +63,8 @@ function safeId(id) {
 export function sessionGroupFromEndpoint(endpoint) {
   const ep = parseEndpoint(endpoint);
   if (!ep.id) throw new Error(`invalid DingTalk endpoint: ${JSON.stringify(String(endpoint ?? '').slice(0, 64))}`);
-  const name = `${ep.type === 'group' ? 'group' : 'dm'}-${safeId(ep.id)}`;
+  const isGroup = ep.type === 'group';
+  const name = `${isGroup ? 'group' : 'dm'}-${safeId(ep.id, isGroup)}`;
   if (!isValidSessionGroup(name)) {
     throw new Error(`cannot map endpoint id to a session group: ${JSON.stringify(ep.id.slice(0, 64))}`);
   }

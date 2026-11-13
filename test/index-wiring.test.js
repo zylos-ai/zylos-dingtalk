@@ -268,3 +268,60 @@ describe('owner bind wiring', () => {
     expect(forwarded()).toBe(0);
   });
 });
+
+// ─── Conversation records (outbound policy proof) ────────────────────────────
+
+const { readStore } = await import('../src/lib/conversations.js');
+const { checkOutbound } = await import('../src/lib/outbound.js');
+const { parseEndpoint } = await import('../src/lib/session-group.js');
+
+describe('conversation records written on inbound', () => {
+  const storeFile = path.join(TEST_DATA_DIR, 'conversations.json');
+  const lastEndpoint = () => {
+    const args = mockExecFile.mock.calls.at(-1)[1];
+    return args[args.indexOf('--endpoint') + 1];
+  };
+
+  test('owner group message -> real type + owner proof recorded; reply allowed end-to-end', async () => {
+    setConfig(baseConfig({ groups: {} }));
+    const msg = groupMsg({ senderStaffId: 'owner1', conversationId: 'cidOwn' });
+    await dispatch(msg);
+    const store = readStore(storeFile);
+    expect(store.conversations.cidOwn.type).toBe('group');
+    expect(store.inbound[`cidOwn|${msg.msgId}`].senderStaffId).toBe('owner1');
+    const ep = lastEndpoint();
+    expect(checkOutbound(testConfig, parseEndpoint(ep), store).reason).toBeNull();
+    // A proactive send (no msg) to the same non-enabled group stays blocked.
+    expect(checkOutbound(testConfig, parseEndpoint('cidOwn|type:group'), store).reason).toMatch(/not enabled/);
+  });
+
+  test('denied non-owner group message -> type recorded, no proof', async () => {
+    setConfig(baseConfig({ groups: {} }));
+    const msg = groupMsg({ senderStaffId: 'u9', conversationId: 'cidDenied' });
+    await dispatch(msg);
+    const store = readStore(storeFile);
+    expect(store.conversations.cidDenied.type).toBe('group');
+    expect(store.inbound[`cidDenied|${msg.msgId}`]).toBeUndefined();
+  });
+
+  test('DM records p2p by staffId; a group endpoint forged with that id is blocked', async () => {
+    setConfig(baseConfig({ dmPolicy: 'open' }));
+    await dispatch(dmMsg({ senderStaffId: 'dmUser7' }));
+    const store = readStore(storeFile);
+    expect(store.conversations.dmUser7.type).toBe('p2p');
+    expect(checkOutbound(testConfig, parseEndpoint('dmUser7|type:p2p'), store).reason).toBeNull();
+    expect(checkOutbound(testConfig, parseEndpoint('dmUser7|type:group'), store).reason).toMatch(/does not match/);
+  });
+
+  test('/internal/get-webhook returns the stored sessionWebhook URL', async () => {
+    setConfig(baseConfig({ groups: {} }));
+    await dispatch(groupMsg({ senderStaffId: 'owner1', conversationId: 'cidHook' }));
+    const token = fs.readFileSync(path.join(TEST_DATA_DIR, '.internal-token'), 'utf8').trim();
+    const res = await fetch(`http://127.0.0.1:${process.env.DINGTALK_INTERNAL_PORT}/internal/get-webhook`, {
+      method: 'POST',
+      headers: { 'x-internal-token': token, 'content-type': 'application/json' },
+      body: JSON.stringify({ endpoint: lastEndpoint() }),
+    });
+    expect(await res.json()).toEqual({ ok: true, url: 'https://hook/group' });
+  });
+});
