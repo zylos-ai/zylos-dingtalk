@@ -174,13 +174,54 @@ describe('sendToC4 rejection handling', () => {
     expect(await runRaw([[spawnError(), ''], [killed(), '']]))
       .toEqual({ outcome: 'failed', notices: [UNCERTAIN_REPLY], calls: 2 });
   });
+});
 
-  test('invalid endpoint is never sent to the overall group', async () => {
+describe('sendToC4 session group resolution', () => {
+  let dir;
+  const prev = process.env.ZYLOS_DIR;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-c4-'));
+    fs.mkdirSync(path.join(dir, '.claude/skills/comm-bridge/scripts'), { recursive: true });
+    process.env.ZYLOS_DIR = dir;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (prev === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = prev;
+  });
+  const supportGroups = () => fs.writeFileSync(
+    path.join(dir, '.claude/skills/comm-bridge/scripts/c4-receive-options.json'),
+    JSON.stringify({ options: { '--session-group': { takesValue: true } } }));
+  const send = (endpoint) => new Promise((resolve) => {
     const notices = [];
-    let called = false;
-    await new Promise((resolve) => sendToC4('dingtalk', 'a b|type:p2p', 'hi', (n) => notices.push(n),
-      { exec: () => { called = true; }, onDone: resolve }));
-    expect(called).toBe(false);
-    expect(notices).toEqual([GENERIC_REJECT_REPLY]);
+    const calls = [];
+    const exec = (_bin, args, _opts, cb) => { calls.push(args); cb(null, ''); };
+    sendToC4('dingtalk', endpoint, 'hi', (n) => notices.push(n),
+      { exec, retryDelayMs: 1, onDone: (outcome) => resolve({ outcome, notices, calls }) });
+  });
+
+  test('new Core: invalid endpoint is never sent to the overall group', async () => {
+    supportGroups();
+    expect(await send('a b|type:p2p')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+  });
+
+  test('new Core: user@corp staffId is rejected (unchanged)', async () => {
+    supportGroups();
+    expect(await send('user@corp|type:p2p|msg:m')).toEqual({ outcome: 'rejected', notices: [GENERIC_REJECT_REPLY], calls: [] });
+  });
+
+  test('new Core: valid endpoint carries --session-group', async () => {
+    supportGroups();
+    const { outcome, calls } = await send('u1|type:p2p|msg:m');
+    expect(outcome).toBe('sent');
+    expect(calls[0]).toContain('--session-group');
+  });
+
+  test('old Core: user@corp staffId is delivered without a session group (0.2.0 behaviour)', async () => {
+    const { outcome, notices, calls } = await send('user@corp|type:p2p|msg:m');
+    expect(outcome).toBe('sent');
+    expect(notices).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).not.toContain('--session-group');
+    expect(calls[0]).toContain('user@corp|type:p2p|msg:m');
   });
 });

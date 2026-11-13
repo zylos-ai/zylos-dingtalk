@@ -100,9 +100,11 @@ export function sendToC4(channel, endpoint, content, onReject, { retryDelayMs = 
     onReject?.(GENERIC_REJECT_REPLY);
     return done('rejected');
   }
+  // Resolve the group only when Core supports it: on older Core the
+  // endpoint is delivered as before (0.2.0), whatever its staffId.
   let sessionGroup;
   try {
-    sessionGroup = sessionGroupFromEndpoint(endpoint);
+    if (c4ReceiveSupportsOption('--session-group')) sessionGroup = sessionGroupFromEndpoint(endpoint);
   } catch (err) {
     // Never fall back to the overall group.
     console.error(`[dingtalk] cannot derive session group, not sending: ${err.message}`);
