@@ -128,7 +128,7 @@ export function readGroupStore(storePath = SESSION_GROUP_STORE) {
 function withLock(storePath, fn) {
   const lock = `${storePath}.lock`;
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 1000; // stay well inside Core's 5s session-group lookup limit
   for (;;) {
     try {
       fs.closeSync(fs.openSync(lock, 'wx', 0o600));
