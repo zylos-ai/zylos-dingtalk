@@ -5,8 +5,9 @@
  * DingTalk callbacks (src/lib/conversations.js), never from the `type` the
  * agent wrote into the endpoint. Unknown ids are treated as groups (the
  * strictest case); the bound owner's staffId counts as a known 1:1 chat
- * (it was bound from a DM callback), and ids listed under `groups` (admin
- * config) count as known groups. When the endpoint's declared type disagrees
+ * (it was bound from a DM callback), staffIds listed under `dmAllowFrom`
+ * (admin config) count as known 1:1 chats, and ids listed under `groups`
+ * (admin config) count as known groups. When the endpoint's declared type disagrees
  * with the real type the send is blocked, so routing never follows a forged type.
  *
  * - DM: only staffIds the inbound DM policy accepts (owner always).
@@ -17,7 +18,7 @@
  *
  * Kept free of side effects so it can be unit tested.
  */
-import { checkDMPermission, isOwner } from './access.js';
+import { checkDMPermission, isInAllowList, isOwner } from './access.js';
 import { lookupConversationType, lookupInbound } from './conversations.js';
 
 /**
@@ -28,6 +29,7 @@ export function realConversationType(config, store, id) {
   const recorded = lookupConversationType(store, id);
   if (recorded) return recorded;
   if (config.owner?.bound && config.owner.staff_id && String(config.owner.staff_id) === id) return 'p2p';
+  if (isInAllowList(config.dmAllowFrom, id)) return 'p2p';
   if (Object.hasOwn(config.groups || {}, id)) return 'group';
   return null;
 }

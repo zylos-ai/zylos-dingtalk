@@ -57,6 +57,17 @@ describe('real type comes from component records, not the endpoint', () => {
     expect(reason(cfg, ep('cidA', 'group'), null)).toBeNull();
     expect(reason(cfg, ep('u-x', 'p2p'), null)).not.toBeNull();
   });
+
+  test('dmAllowFrom staffIds are known DMs without a record', () => {
+    const cfg = { owner, dmPolicy: 'allowlist', dmAllowFrom: ['u-a', 123] };
+    expect(checkOutbound(cfg, ep('u-a', 'p2p'), null)).toEqual({ reason: null, type: 'p2p' });
+    expect(reason(cfg, ep('123', 'p2p'), store())).toBeNull();
+    expect(reason(cfg, ep('u-a', 'group'), null)).toMatch(/does not match/);
+    // A recorded type still wins over config.
+    expect(reason(cfg, ep('u-a', 'p2p'), store(grp('u-a')))).toMatch(/does not match/);
+    // Known as DM, but still subject to dmPolicy.
+    expect(reason({ ...cfg, dmPolicy: 'owner' }, ep('u-a', 'p2p'), null)).toMatch(/DM recipient u-a/);
+  });
 });
 
 describe('outbound group policy', () => {
@@ -72,6 +83,15 @@ describe('outbound group policy', () => {
   test('non-enabled group: proactive send blocked', () => expect(reason(allowlist, ep('cidX', 'group'), s)).toMatch(/group cidX is not enabled/));
   test('non-enabled group: reply to an owner message allowed', () => expect(reason(allowlist, ep('cidX', 'group', 'm1'), s)).toBeNull());
   test('non-enabled group: reply to a non-owner message blocked', () => expect(reason(allowlist, ep('cidX', 'group', 'm2'), s)).not.toBeNull());
+  test('proof without a valid timestamp counts as expired', () => {
+    const bad = store(grp('cidX'), {
+      'cidX|noAt': { senderStaffId: 'u-owner' },
+      'cidX|strAt': { senderStaffId: 'u-owner', at: 'x' },
+    });
+    expect(lookupInbound(bad, 'cidX', 'noAt')).toBeNull();
+    expect(reason(allowlist, ep('cidX', 'group', 'noAt'), bad)).not.toBeNull();
+    expect(reason(allowlist, ep('cidX', 'group', 'strAt'), bad)).not.toBeNull();
+  });
   test('owner proof expires after the TTL', () => expect(reason(allowlist, ep('cidX', 'group', 'old'), s)).not.toBeNull());
   test('proof is per conversation: owner msg id from another group does not count', () => {
     expect(reason(allowlist, ep('cidZ', 'group', 'm1'), store(grp('cidZ'), s.inbound))).not.toBeNull();

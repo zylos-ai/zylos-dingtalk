@@ -295,6 +295,18 @@ describe('conversation records written on inbound', () => {
     expect(checkOutbound(testConfig, parseEndpoint('cidOwn|type:group'), store).reason).toMatch(/not enabled/);
   });
 
+  test('accepted non-owner group message -> type recorded, no proof (cannot evict owner proofs)', async () => {
+    setConfig(baseConfig({ groupPolicy: 'open' }));
+    const own = groupMsg({ senderStaffId: 'owner1', conversationId: 'cidMix' });
+    await dispatch(own);
+    const other = groupMsg({ senderStaffId: 'u9', conversationId: 'cidOpen' });
+    await dispatch(other);
+    const store = readStore(storeFile);
+    expect(store.conversations.cidOpen.type).toBe('group');
+    expect(store.inbound[`cidOpen|${other.msgId}`]).toBeUndefined();
+    expect(store.inbound[`cidMix|${own.msgId}`].senderStaffId).toBe('owner1');
+  });
+
   test('denied non-owner group message -> type recorded, no proof', async () => {
     setConfig(baseConfig({ groups: {} }));
     const msg = groupMsg({ senderStaffId: 'u9', conversationId: 'cidDenied' });

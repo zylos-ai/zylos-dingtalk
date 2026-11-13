@@ -335,9 +335,10 @@ async function handleBotMessage(res) {
 
     // Store sessionWebhook in a temp map so send.js can use it
     storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
-    // Persisted proof of who wrote this accepted message (owner-reply exception
-    // in non-enabled groups); survives webhook expiry and restarts.
-    safeRecordInbound({ id: conversationKey, type: realType, msgId, senderStaffId, accepted: true });
+    // Persisted proof that the owner wrote this accepted message (owner-reply
+    // exception in non-enabled groups); survives webhook expiry and restarts.
+    // Only owner messages are written, so other traffic cannot evict the proof.
+    safeRecordInbound({ id: conversationKey, type: realType, msgId, senderStaffId, accepted: isOwner(senderStaffId) });
 
     let c4Content = '';
 

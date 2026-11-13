@@ -6,8 +6,10 @@
  *   (conversationType "1" -> 'p2p' keyed by senderStaffId, "2" -> 'group'
  *   keyed by conversationId). Outbound policy uses this, never the `type`
  *   written into an endpoint by the agent.
- * - inbound["<conversationId>|<msgId>"]: sender of an accepted group message,
- *   the proof for the owner-reply exception. Persisted, so it survives
+ * - inbound["<conversationId>|<msgId>"]: sender of an accepted group message
+ *   written by the owner, the proof for the owner-reply exception (the
+ *   component only writes owner messages, so other groups' traffic cannot
+ *   evict it). Persisted, so it survives
  *   sessionWebhook expiry and component restarts (bounded by TTL and count).
  *
  * Writes are atomic (tmp + rename). An unreadable file reads as empty, so
@@ -95,6 +97,6 @@ export function lookupConversationType(store, id) {
 export function lookupInbound(store, id, msgId, now = Date.now()) {
   if (!id || !msgId) return null;
   const rec = store?.inbound?.[`${id}|${msgId}`];
-  if (!rec?.senderStaffId || now - rec.at > INBOUND_TTL_MS) return null;
+  if (!rec?.senderStaffId || !(now - rec.at <= INBOUND_TTL_MS)) return null; // missing/bad `at` = expired
   return { senderStaffId: rec.senderStaffId };
 }
