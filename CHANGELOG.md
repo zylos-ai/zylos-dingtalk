@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-11-09
+## [0.3.0] - 2026-11-16
 
 ### Added
 - Session groups for multi-session zylos-core: DMs are `dm-<staffId>`, groups
