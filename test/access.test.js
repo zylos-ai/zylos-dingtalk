@@ -56,8 +56,12 @@ describe('user-facing texts', () => {
 });
 
 describe('getGroupDenyReason', () => {
-  test('owner is always allowed', () => {
-    expect(getGroupDenyReason({ owner: OWNER, groupPolicy: 'disabled' }, 'owner1', 'cid1')).toBeNull();
+  test('owner bypasses the group allowlist', () => {
+    expect(getGroupDenyReason({ owner: OWNER, groupPolicy: 'allowlist', groups: {} }, 'owner1', 'cid1')).toBeNull();
+  });
+
+  test('disabled policy rejects the owner too', () => {
+    expect(getGroupDenyReason({ owner: OWNER, groupPolicy: 'disabled' }, 'owner1', 'cid1')).toBe(DENY_GROUP_NOT_ENABLED);
   });
 
   test('disabled policy -> group not enabled', () => {

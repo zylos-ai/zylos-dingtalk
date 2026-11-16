@@ -4,9 +4,10 @@ import fs from 'fs';
 import crypto from 'crypto';
 import http from 'http';
 import dotenv from 'dotenv';
-import { execFile } from 'child_process';
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
 import { getConfig, saveConfig, watchConfig, stopWatching, getCredentials, DATA_DIR } from './lib/config.js';
+import { sendToC4 } from './lib/c4.js';
+import { recordInbound, conversationTypeFromCallback } from './lib/conversations.js';
 import { getUserInfo } from './lib/contact.js';
 import {
   addThinkingEmoji,
@@ -26,7 +27,6 @@ import {
 
 dotenv.config({ path: path.join(os.homedir(), 'zylos/.env') });
 
-const C4_RECEIVE = path.join(os.homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const INTERNAL_TOKEN_PATH = path.join(DATA_DIR, '.internal-token');
 
@@ -48,6 +48,7 @@ const DEFAULT_HISTORY_LIMIT = 5;
 // User name cache: staffId -> { name, cachedAt }
 const userNameCache = new Map();
 const USER_CACHE_TTL = 10 * 60 * 1000;
+const CONVERSATIONS_PATH = path.join(DATA_DIR, 'conversations.json');
 const USER_CACHE_PATH = path.join(DATA_DIR, 'user-cache.json');
 
 // --- Init ---
@@ -173,24 +174,6 @@ function tryBindOwner(staffId, name, sessionWebhook) {
   }).bound;
 }
 
-// --- C4 forwarding ---
-function forwardToC4(channel, endpoint, content) {
-  const args = [
-    C4_RECEIVE,
-    '--channel', channel,
-    '--endpoint', endpoint,
-    '--json',
-    '--content', content,
-  ];
-
-  execFile('node', args, { timeout: 30000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error('[dingtalk] C4 forward error:', err.message);
-      if (stderr) console.error('[dingtalk] C4 stderr:', stderr);
-    }
-  });
-}
-
 // --- Message handler ---
 async function handleBotMessage(res) {
   let msg;
@@ -231,6 +214,11 @@ async function handleBotMessage(res) {
   // conversationType: "1" = 1:1 DM, "2" = group
   const isGroup = conversationType === '2';
   const isDM = !isGroup;
+  const realType = conversationTypeFromCallback(conversationType);
+  const conversationKey = isGroup ? conversationId : senderStaffId;
+  // Record the real conversation type: outbound policy relies on it, never
+  // on the type the agent writes into an endpoint.
+  safeRecordInbound({ id: conversationKey, type: realType });
   let userName = senderNick || String(senderStaffId || 'Unknown');
 
   // ACK as early as possible to avoid DingTalk 60s redelivery.
@@ -347,6 +335,10 @@ async function handleBotMessage(res) {
 
     // Store sessionWebhook in a temp map so send.js can use it
     storeSessionWebhook(replyEndpoint, sessionWebhook, sessionWebhookExpiredTime);
+    // Persisted proof that the owner wrote this accepted message (owner-reply
+    // exception in non-enabled groups); survives webhook expiry and restarts.
+    // Only owner messages are written, so other traffic cannot evict the proof.
+    safeRecordInbound({ id: conversationKey, type: realType, msgId, senderStaffId, accepted: isOwner(senderStaffId) });
 
     let c4Content = '';
 
@@ -372,7 +364,12 @@ async function handleBotMessage(res) {
     }
 
     // Forward to C4
-    forwardToC4('dingtalk', replyEndpoint, c4Content);
+    sendToC4('dingtalk', replyEndpoint, c4Content, (notice) => {
+      if (notice && sessionWebhook) {
+        replyWebhookText(sessionWebhook, notice).catch(err =>
+          console.error(`[dingtalk] Failed to send C4 reject notice: ${err?.message ?? String(err)}`));
+      }
+    });
 
     console.log(`[dingtalk] ${isDM ? 'DM' : 'GROUP'} from ${userName} (msgtype=${msgtype}, len=${contentText.length})`);
   } finally {
@@ -395,6 +392,14 @@ const WEBHOOK_CLEANUP_INTERVAL = 60000;
 function storeSessionWebhook(endpoint, webhookUrl, expiresAt) {
   if (!webhookUrl) return;
   sessionWebhooks.set(endpoint, { url: webhookUrl, expiresAt });
+}
+
+function safeRecordInbound(rec) {
+  try {
+    recordInbound(CONVERSATIONS_PATH, rec);
+  } catch (err) {
+    console.error(`[dingtalk] Failed to record conversation: ${err.message}`);
+  }
 }
 
 // Clean up expired webhooks
